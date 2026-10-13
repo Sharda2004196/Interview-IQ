@@ -9,4 +9,4 @@ youtube-transcript-api==1.2.4
 trafilatura==2.2.0
 lxml_html_clean==0.4.5
 opentelemetry-api==1.42.1
-langfuse==4.17.0
+langfuse==3.8.0

@@ -6,6 +6,7 @@ interviewiq_agent/__pycache__/
 *.pyc
 # Secrets — NEVER commit. Render injects these as dashboard env vars.
 .env
+.env*
 *.env
 interviewiq_agent/.env
 
@@ -18,6 +19,7 @@ CLAUDE.md
 node_modules/
 frontend/node_modules/
 frontend/.next/
+*.tsbuildinfo
 *.log
 # Regenerable eval output — the script stays, its last run doesn't.
 evals/results.json

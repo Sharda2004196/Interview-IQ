@@ -1,5 +1,9 @@
 """Langfuse tracing — one trace per interview session, one span per turn.
 
+SDK pinned to v3 (langfuse==3.8.0): v4 needs opentelemetry-api>=1.45, which
+deadlocks pip against google-adk 2.8.0 (otel<=1.42.1) and fails the Render
+Docker build. v3's ceiling (>=1.33.1, <2) resolves cleanly with otel 1.42.1.
+
 Fail-closed design: every helper swallows its own errors and returns None.
 Tracing must NEVER break an interview (bad keys, no network, SDK drift).
 No keys in env -> fully inert (local dev without Langfuse keeps working).
@@ -14,6 +18,16 @@ _client = None
 _warned = False
 # session_id -> trace_id (one trace per interview, spans attach to it)
 _traces: dict[str, str] = {}
+
+
+class _Span:
+    """Opaque handle: v3 span client + its trace id (for scores)."""
+
+    __slots__ = ("span", "trace_id")
+
+    def __init__(self, span, trace_id: str):
+        self.span = span
+        self.trace_id = trace_id
 
 
 def _keys():
@@ -63,18 +77,19 @@ def trace_id_for(session_id: str) -> str | None:
 
 
 def start_span(session_id: str, name: str, input=None, metadata=None):
-    """Open a turn span under the session's trace. Returns span or None."""
+    """Open a turn span under the session's trace. Returns handle or None."""
     try:
         c = get_client()
         tid = trace_id_for(session_id)
         if c is None or tid is None:
             return None
-        return c.start_observation(
+        span = c.start_span(
             trace_context={"trace_id": tid},
             name=name,
             input=input,
             metadata=metadata or {},
         )
+        return _Span(span, tid)
     except Exception:  # noqa: BLE001
         return None
 
@@ -84,8 +99,9 @@ def end_span(span, output=None, metadata=None, level: str = "DEFAULT"):
     if span is None:
         return
     try:
-        span.update(output=output, metadata=metadata or {}, level=level)
-        span.end()
+        inner = span.span if isinstance(span, _Span) else span
+        inner.update(output=output, metadata=metadata or {}, level=level)
+        inner.end()
     except Exception:  # noqa: BLE001
         pass
 
@@ -95,7 +111,17 @@ def score_span(span, name: str, value: float):
     if span is None:
         return
     try:
-        span.score(name=name, value=float(value))
+        c = get_client()
+        if c is None:
+            return
+        if isinstance(span, _Span):
+            # Trace-level score (v3 span handles expose no stable id):
+            # named per round, listed on the session's trace.
+            c.create_score(
+                trace_id=span.trace_id, name=name, value=float(value)
+            )
+        else:
+            c.create_score(name=name, value=float(value))
     except Exception:  # noqa: BLE001
         pass
 
