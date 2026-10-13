@@ -1,0 +1,19 @@
+# Local-first: `docker compose up` runs the whole backend.
+# .env is injected at runtime, never baked into the image.
+# (Langfuse self-hosted joins here pre-deploy, when there's traffic to trace.)
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - interviewiq_agent/.env
+    environment:
+      # ADK drags in the OTel SDK; its contextvars detach crashes WS streaming
+      # ("Token created in a different Context"). We use no tracing, so off.
+      - OTEL_SDK_DISABLED=true
+      # Container has no IPv6 route; grpc tries IPv6 first and hangs 60s per
+      # Firestore commit. Native resolver prefers working IPv4 (proven live).
+      - GRPC_DNS_RESOLVER=native

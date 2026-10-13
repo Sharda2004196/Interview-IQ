@@ -1,0 +1,52 @@
+# Render Blueprint — InterviewIQ prod (free tier).
+# Deploy: Render dashboard -> New -> Blueprint -> point at the GitHub repo.
+# Secrets (sync: false) are filled ONCE in the dashboard, never committed.
+services:
+  - type: web
+    name: interviewiq-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile.backend
+    dockerContext: .
+    healthCheckPath: /healthz
+    envVars:
+      - key: GOOGLE_GENAI_USE_VERTEXAI
+        value: FALSE
+      - key: PINECONE_INDEX
+        value: interviewiq-kb
+      - key: VOICE_LIVE_ENABLED
+        value: false
+      - key: LANGFUSE_ENV
+        value: production
+      # Filled in dashboard AFTER first deploy (backend URL known):
+      # FRONTEND_URL=https://<frontend-service>.onrender.com
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      - key: LANGFUSE_BASE_URL
+        sync: false
+
+  - type: web
+    name: interviewiq-frontend
+    runtime: node
+    plan: free
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    # `next start` honors Render's PORT env automatically.
+    startCommand: npm start
+    envVars:
+      # IMPORTANT: NEXT_PUBLIC_* bakes in at BUILD time. Set the backend URL
+      # first, then hit Manual Deploy -> Rebuild on this service.
+      - key: NEXT_PUBLIC_API_URL
+        sync: false

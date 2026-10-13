@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+.pytest_cache/
+backend/uploads/
+interviewiq_agent/__pycache__/
+*.pyc
+# Secrets — NEVER commit. Render injects these as dashboard env vars.
+.env
+*.env
+interviewiq_agent/.env
+
+# Internal process notes — dev-only, not part of the deployed app.
+docs/
+AGENTS.md
+CLAUDE.md
+
+# Runtime artifacts — never belong in git (node_modules alone is 500MB+).
+node_modules/
+frontend/node_modules/
+frontend/.next/
+*.log
+# Regenerable eval output — the script stays, its last run doesn't.
+evals/results.json
+evals/run.err
+evals/run.log

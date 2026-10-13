@@ -1,0 +1,13 @@
+# Keep the image small and secret-free: code + deps only.
+.venv/
+__pycache__/
+*.pyc
+.git/
+frontend/
+node_modules/
+docs/
+tests/
+evals/
+backend/uploads/
+.env
+*.env
