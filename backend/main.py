@@ -6,14 +6,14 @@ import os
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
 from interviewiq_agent.tools.parse_file import parse_file
 from interviewiq_agent.tools.retrieve_context import upsert_document
 
-from .auth import get_current_user
+from .auth import STRICT, check_ws_token, get_current_user
 from .observability import (
     drop_session as lf_drop_session,
     end_span as lf_end_span,
@@ -168,6 +168,10 @@ async def interview_ws(websocket: WebSocket, session_id: str):
             )
             return
         config, ws_user = pending
+        # WS auth state: any client message may carry {"token": ...} (verified
+        # against the POST uid, consumed, never treated as an answer). Strict
+        # mode refuses answers until a valid token has been seen.
+        ws_authed = False
         # Closed rounds (non-FOLLOW_UP verdicts) + whether a probe is open.
         # A FOLLOW_UP opens a round that only the next verdict closes — ending
         # on bank state closed interviews on top of unanswered probes.
@@ -244,6 +248,45 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     WSError(message="Send JSON: {\"text\": \"...\"} or {\"end\": true}.").model_dump_json(),
                 )
                 continue
+            # WS auth frame: {"token": ...} is verified against the POST uid,
+            # consumed, and never treated as an answer. Token-only frames set
+            # the flag and wait; combined frames fall through to normal
+            # answer/End processing below. Zero added latency (no waiting).
+            try:
+                if check_ws_token(msg, ws_user):
+                    ws_authed = True
+                    if not msg.get("text") and not msg.get("end"):
+                        continue
+            except HTTPException as ex:
+                await _send_safe(
+                    websocket,
+                    WSError(message=f"Auth rejected ({ex.detail}).").model_dump_json(),
+                )
+                try:
+                    await websocket.close()
+                except RuntimeError:
+                    pass
+                return
+            except Exception as ex:  # noqa: BLE001 — e.g. Firebase not configured
+                await _send_safe(
+                    websocket,
+                    WSError(message=f"Auth unavailable ({type(ex).__name__}).").model_dump_json(),
+                )
+                try:
+                    await websocket.close()
+                except RuntimeError:
+                    pass
+                return
+            if STRICT and not ws_authed:
+                await _send_safe(
+                    websocket,
+                    WSError(message="Login required — reconnect with a token.").model_dump_json(),
+                )
+                try:
+                    await websocket.close()
+                except RuntimeError:
+                    pass
+                return
             if msg.get("end"):
                 async for delta in stream_reply(
                     session_id, "The user ended the interview. Give the final report now.", ws_user

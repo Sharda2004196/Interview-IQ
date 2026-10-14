@@ -86,6 +86,15 @@ def test_report_defaults():
     assert r.overall == 0.0 and r.per_question == [] and r.adjustment == ""
 
 
+# --- WS auth frames: tokenless messages pass through untouched ---
+def test_check_ws_token_passthrough():
+    from backend.auth import check_ws_token
+
+    assert check_ws_token({"text": "my answer"}, "local-dev") is None
+    assert check_ws_token({"end": True}, "local-dev") is None
+    assert check_ws_token({}, "local-dev") is None
+
+
 # --- quota classifier: honest errors, no private ADK imports ---
 def test_is_quota_error():
     from backend.runner import _is_quota_error
