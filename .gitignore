@@ -14,6 +14,7 @@ interviewiq_agent/.env
 docs/
 AGENTS.md
 CLAUDE.md
+Py_sdk_migration.md
 
 # Runtime artifacts — never belong in git (node_modules alone is 500MB+).
 node_modules/
