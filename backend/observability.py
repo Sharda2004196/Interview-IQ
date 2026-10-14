@@ -1,139 +1,211 @@
-"""Langfuse tracing — one trace per interview session, one span per turn.
+"""Langfuse tracing via native OTLP/HTTP — no Langfuse SDK dependency.
 
-SDK pinned to v3 (langfuse==3.8.0): v4 needs opentelemetry-api>=1.45, which
-deadlocks pip against google-adk 2.8.0 (otel<=1.42.1) and fails the Render
-Docker build. v3's ceiling (>=1.33.1, <2) resolves cleanly with otel 1.42.1.
+Why hand-rolled: langfuse>=4 needs opentelemetry-api>=1.45, which deadlocks
+pip against google-adk 2.8.0 (otel<=1.42.1) and fails the Render Docker build.
+Langfuse v4 accepts native OTLP spans at /api/public/otel (documented), so we
+speak that protocol directly with httpx (already a dependency via ADK).
 
-Fail-closed design: every helper swallows its own errors and returns None.
-Tracing must NEVER break an interview (bad keys, no network, SDK drift).
-No keys in env -> fully inert (local dev without Langfuse keeps working).
+Same fail-closed contract: every helper swallows errors, returns None.
+No keys -> fully inert. OTEL_SDK_DISABLED does not affect us (no SDK used).
+
+Attribute map (per Langfuse native-OTel docs):
+  trace name .... langfuse.trace.name
+  session ...... langfuse.session.id
+  user ......... langfuse.user.id
+  environment .. langfuse.environment
+  metadata ..... langfuse.trace.metadata.<key> (top-level, filterable)
+  input/output . langfuse.observation.input / .output (JSON strings)
 """
 
+import base64
 import logging
 import os
+import secrets
+import time
 
 log = logging.getLogger(__name__)
 
-_client = None
 _warned = False
 # session_id -> trace_id (one trace per interview, spans attach to it)
 _traces: dict[str, str] = {}
 
 
 class _Span:
-    """Opaque handle: v3 span client + its trace id (for scores)."""
+    """Opaque handle: ids + payload accumulated until end_span sends it."""
 
-    __slots__ = ("span", "trace_id")
+    __slots__ = ("trace_id", "span_id", "parent_id", "name", "start_ns", "attrs")
 
-    def __init__(self, span, trace_id: str):
-        self.span = span
+    def __init__(self, trace_id, span_id, parent_id, name, attrs):
         self.trace_id = trace_id
+        self.span_id = span_id
+        self.parent_id = parent_id
+        self.name = name
+        self.start_ns = time.time_ns()
+        self.attrs = dict(attrs)
 
 
 def _keys():
     pub = os.getenv("LANGFUSE_PUBLIC_KEY", "")
     sec = os.getenv("LANGFUSE_SECRET_KEY", "")
-    host = os.getenv("LANGFUSE_HOST", "") or os.getenv("LANGFUSE_BASE_URL", "")
+    host = (os.getenv("LANGFUSE_HOST", "") or os.getenv("LANGFUSE_BASE_URL", "")).rstrip("/")
     env = os.getenv("LANGFUSE_ENV", "development")
     if not (pub and sec and host):
         return None
-    return pub, sec, host, env
+    auth = base64.b64encode(f"{pub}:{sec}".encode()).decode()
+    return host, auth, env
+
+
+def _warn_once(msg: str, ex: Exception):
+    global _warned
+    if not _warned:
+        log.warning("Langfuse disabled (%s: %s)", msg, ex)
+        _warned = True
 
 
 def get_client():
-    """Singleton Langfuse client, or None when unconfigured/broken."""
-    global _client, _warned
-    if _client is not None:
-        return _client
+    """Compat shim: truthy when configured (keys present + httpx working)."""
     try:
-        from langfuse import Langfuse
+        import httpx  # noqa: F401 — proves the only dependency exists
 
-        k = _keys()
-        if k is None:
-            return None
-        pub, sec, host, env = k
-        _client = Langfuse(
-            public_key=pub, secret_key=sec, host=host, environment=env
-        )
-        return _client
-    except Exception as ex:  # noqa: BLE001 — tracing is best-effort
-        if not _warned:
-            log.warning("Langfuse disabled (%s: %s)", type(ex).__name__, ex)
-            _warned = True
+        return _keys() is not None
+    except Exception as ex:  # noqa: BLE001
+        _warn_once("no-http-client", ex)
         return None
+
+
+def _any_value(v):
+    if isinstance(v, bool):
+        return {"boolValue": v}
+    if isinstance(v, int):
+        return {"intValue": str(v)}
+    if isinstance(v, float):
+        return {"doubleValue": v}
+    if isinstance(v, (list, tuple)):
+        return {"arrayValue": {"values": [_any_value(i) for i in v]}}
+    return {"stringValue": "" if v is None else str(v)}
+
+
+def _post(path: str, payload: dict, timeout: float = 10.0) -> bool:
+    k = _keys()
+    if k is None:
+        return False
+    host, auth, _env = k
+    try:
+        import httpx
+
+        r = httpx.post(
+            f"{host}{path}",
+            json=payload,
+            headers={
+                "Authorization": f"Basic {auth}",
+                "x-langfuse-ingestion-version": "4",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+        )
+        if r.status_code >= 300:
+            _warn_once(f"http-{r.status_code}", RuntimeError(r.text[:200]))
+            return False
+        return True
+    except Exception as ex:  # noqa: BLE001
+        _warn_once("send-failed", ex)
+        return False
 
 
 def trace_id_for(session_id: str) -> str | None:
     """Stable trace id per session (created once, reused by every turn span)."""
+    if get_client() is None:
+        return None
     if session_id not in _traces:
-        try:
-            c = get_client()
-            if c is None:
-                return None
-            _traces[session_id] = c.create_trace_id()
-        except Exception:  # noqa: BLE001
-            return None
+        _traces[session_id] = secrets.token_hex(16)
     return _traces.get(session_id)
 
 
+def _base_attrs(session_id: str, extra_meta: dict, env: str) -> dict:
+    attrs = {
+        "langfuse.session.id": session_id,
+        "langfuse.environment": env,
+    }
+    for k, v in (extra_meta or {}).items():
+        attrs[f"langfuse.trace.metadata.{k}"] = v
+    return attrs
+
+
 def start_span(session_id: str, name: str, input=None, metadata=None):
-    """Open a turn span under the session's trace. Returns handle or None."""
+    """Open a turn span (sent on end_span). Returns handle or None."""
     try:
-        c = get_client()
+        import json as _json
+
+        k = _keys()
         tid = trace_id_for(session_id)
-        if c is None or tid is None:
+        if k is None or tid is None:
             return None
-        span = c.start_span(
-            trace_context={"trace_id": tid},
-            name=name,
-            input=input,
-            metadata=metadata or {},
-        )
-        return _Span(span, tid)
+        _host, _auth, env = k
+        attrs = _base_attrs(session_id, metadata, env)
+        attrs["langfuse.trace.name"] = f"interview-{session_id}"
+        attrs["langfuse.observation.type"] = "span"
+        if input is not None:
+            attrs["langfuse.observation.input"] = _json.dumps(input, default=str)
+        return _Span(tid, secrets.token_hex(8), None, name, attrs)
     except Exception:  # noqa: BLE001
         return None
 
 
 def end_span(span, output=None, metadata=None, level: str = "DEFAULT"):
-    """Close a span with output. Never raises."""
+    """Send the span (synchronous; ~200ms noise next to 10-60s LLM turns)."""
     if span is None:
         return
     try:
-        inner = span.span if isinstance(span, _Span) else span
-        inner.update(output=output, metadata=metadata or {}, level=level)
-        inner.end()
+        import json as _json
+
+        if not isinstance(span, _Span):
+            return
+        for k, v in (metadata or {}).items():
+            span.attrs[f"langfuse.trace.metadata.{k}"] = v
+        span.attrs["langfuse.observation.level"] = level
+        if output is not None:
+            span.attrs["langfuse.observation.output"] = _json.dumps(output, default=str)
+        end_ns = time.time_ns()
+        otlp_span: dict = {
+            "traceId": span.trace_id,
+            "spanId": span.span_id,
+            "name": span.name,
+            "kind": 1,  # INTERNAL
+            "startTimeUnixNano": str(span.start_ns),
+            "endTimeUnixNano": str(end_ns),
+            "attributes": [
+                {"key": k, "value": _any_value(v)} for k, v in span.attrs.items()
+            ],
+            "status": {} if level != "ERROR" else {"code": 2},
+        }
+        if span.parent_id:
+            otlp_span["parentSpanId"] = span.parent_id
+        _post(
+            "/api/public/otel/v1/traces",
+            {"resourceSpans": [{"resource": {}, "scopeSpans": [{"scope": {}, "spans": [otlp_span]}]}]},
+        )
     except Exception:  # noqa: BLE001
         pass
 
 
 def score_span(span, name: str, value: float):
-    """Attach a numeric score (e.g. round score) to a span. Never raises."""
+    """Attach a numeric score to the session trace. Never raises."""
     if span is None:
         return
     try:
-        c = get_client()
-        if c is None:
+        tid = span.trace_id if isinstance(span, _Span) else None
+        if tid is None:
             return
-        if isinstance(span, _Span):
-            # Trace-level score (v3 span handles expose no stable id):
-            # named per round, listed on the session's trace.
-            c.create_score(
-                trace_id=span.trace_id, name=name, value=float(value)
-            )
-        else:
-            c.create_score(name=name, value=float(value))
+        _post(
+            "/api/public/scores",
+            {"traceId": tid, "name": name, "value": float(value)},
+        )
     except Exception:  # noqa: BLE001
         pass
 
 
 def flush():
-    """Push buffered spans. Called on session end; never raises."""
-    try:
-        c = get_client()
-        if c is not None:
-            c.flush()
-    except Exception:  # noqa: BLE001
-        pass
+    """Synchronous sender: nothing buffered, nothing to flush (kept for API)."""
 
 
 def drop_session(session_id: str) -> None:
