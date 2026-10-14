@@ -593,6 +593,14 @@ async def healthz():
     return {"ok": True}
 
 
+@app.head("/healthz")
+async def healthz_head():
+    """Uptime monitors ping HEAD by default — same 200, empty body."""
+    from fastapi.responses import Response
+
+    return Response(status_code=200)
+
+
 @app.post("/upload", response_model=UploadResponse)
 async def upload(file: UploadFile, namespace: str = "default"):
     dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}-{file.filename}"
