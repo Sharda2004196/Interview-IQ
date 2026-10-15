@@ -57,6 +57,8 @@ class Report(BaseModel):
     strengths: str = ""
     gaps: str = ""
     study_next: str = ""
+    verdict: str = ""  # agent's verdict; "" = derive from overall thresholds
+    verdict_why: str = ""
     adjustment: str = ""  # nudge reason when the interviewer applied ±1
 
 

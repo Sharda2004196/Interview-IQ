@@ -97,6 +97,11 @@ def save_score(
     mode: str = "",
     topic: str = "",
     user_id: str = "",
+    strengths: str = "",
+    gaps: str = "",
+    study_next: str = "",
+    verdict: str = "",
+    verdict_why: str = "",
     tool_context: ToolContext | None = None,
 ) -> dict:
     """Persist scores. Overall is COMPUTED here (weighted mean + bounded nudge),
@@ -122,6 +127,11 @@ def save_score(
             "overall": overall,
             "mode": mode,
             "topic": topic,
+            "strengths": strengths,
+            "gaps": gaps,
+            "study_next": study_next,
+            "verdict": verdict,
+            "verdict_why": verdict_why,
             "created_at": _fs.SERVER_TIMESTAMP,
         }
     )

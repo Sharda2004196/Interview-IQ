@@ -29,6 +29,8 @@ export interface Report {
   strengths: string;
   gaps: string;
   study_next: string;
+  verdict: string;
+  verdict_why: string;
   adjustment: string;
 }
 

@@ -54,6 +54,8 @@ export default function ReportPage({
             strengths: "Clear mental models for distributed state, effective communication of trade-offs.",
             gaps: "Could address corner-case failure recovery and throughput limits in more depth.",
             study_next: "1. Raft consensus state machine replication\n2. Optimistic concurrency control\n3. Consistent hashing algorithms",
+            verdict: "",
+            verdict_why: "",
             adjustment: "",
           });
           setIsLoading(false);

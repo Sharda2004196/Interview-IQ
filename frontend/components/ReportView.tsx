@@ -21,14 +21,19 @@ interface ReportViewProps {
 }
 
 export function ReportView({ report }: ReportViewProps) {
-  // Determine verdict based on overall score
+  // Agent-stored verdict wins (it judged the actual session); thresholds are
+  // the fallback for backfilled/legacy docs that predate verdict storage.
+  const stored =
+    report.verdict === "Strong Hire" || report.verdict === "Hire" || report.verdict === "No Hire"
+      ? (report.verdict as VerdictType)
+      : null;
   const getVerdict = (score: number): VerdictType => {
     if (score >= 7.5) return "Strong Hire";
     if (score >= 5.0) return "Hire";
     return "No Hire";
   };
 
-  const verdict = getVerdict(report.overall);
+  const verdict = stored ?? getVerdict(report.overall);
   const verdictStyle = getVerdictStyle(verdict);
   const formattedOverall = Number.isInteger(report.overall)
     ? report.overall.toFixed(1)
@@ -147,7 +152,8 @@ export function ReportView({ report }: ReportViewProps) {
               </span>
             </div>
             <p className="text-xs text-zinc-600 dark:text-zinc-400 max-w-sm">
-              Evaluated across technical correctness, system trade-offs, and communication clarity.
+              {report.verdict_why ||
+                "Evaluated across technical correctness, system trade-offs, and communication clarity."}
             </p>
           </div>
         </div>

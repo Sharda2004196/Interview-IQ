@@ -686,6 +686,11 @@ async def read_report(session_id: str):
         session_id=session_id,
         per_question=data.get("per_question", []),
         overall=data.get("overall", 0.0),
+        strengths=data.get("strengths", "") or "",
+        gaps=data.get("gaps", "") or "",
+        study_next=data.get("study_next", "") or "",
+        verdict=data.get("verdict", "") or "",
+        verdict_why=data.get("verdict_why", "") or "",
         adjustment=data.get("nudge_reason", ""),
     )
 
