@@ -23,7 +23,9 @@ def verify_token(id_token: str) -> str:
 
     _db()  # ensures Admin SDK init from .env creds
     try:
-        return auth.verify_id_token(id_token)["uid"]
+        # 10s leeway: client, server, and container clocks never agree
+        # exactly (Docker VM drift alone costs seconds after sleep).
+        return auth.verify_id_token(id_token, clock_skew_seconds=10)["uid"]
     except Exception as ex:  # noqa: BLE001 — any failure means unauthenticated
         raise HTTPException(status_code=401, detail=f"Invalid auth token: {ex}")
 

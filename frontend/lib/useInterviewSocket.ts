@@ -94,6 +94,19 @@ export function useInterviewSocket({ sessionId, onSessionEnd, enabled = true }: 
         setStatus("connected");
         setErrorMessage(null);
         reconnectAttemptsRef.current = 0;
+        // Identify to the backend (no-op when logged out): the server
+        // verifies the token against the POST uid, then continues normally.
+        // Fire-and-forget — Q1 streaming never waits for this.
+        import("@/lib/firebase")
+          .then(({ getIdToken }) => getIdToken())
+          .then((token) => {
+            if (token && wsRef.current === ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ token }));
+            }
+          })
+          .catch(() => {
+            // ignore — anonymous interview proceeds as before
+          });
       };
 
       ws.onmessage = (event) => {

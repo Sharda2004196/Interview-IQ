@@ -12,6 +12,8 @@ import {
 } from "@phosphor-icons/react";
 import { useInterviewSocket } from "@/lib/useInterviewSocket";
 import { useTurnVoice } from "@/lib/useTurnVoice";
+import { useFirebaseUser } from "@/lib/firebase";
+import { LoginGate } from "@/components/LoginGate";
 import VoicePill from "@/components/bits/VoicePill";
 import { VoiceOrb } from "@/components/VoiceOrb";
 import { ProgressRing } from "@/components/ProgressRing";
@@ -32,8 +34,13 @@ export default function StagePage({
   const router = useRouter();
 
   const [answerInput, setAnswerInput] = useState<string>("");
+  const gateUser = useFirebaseUser();
   const [isVoice, setIsVoice] = useState<boolean>(false);
   const [totalRounds, setTotalRounds] = useState<number>(1);
+  // Text-mode orb energy (state only — the effect lives below, after the
+  // socket hooks, so it can read the live question text).
+  const [textSpeaking, setTextSpeaking] = useState(false);
+  const lastQRef = useRef<string>("");
 
   useEffect(() => {
     const search = new URLSearchParams(window.location.search);
@@ -82,6 +89,20 @@ export default function StagePage({
     return () => window.clearTimeout(t);
   }, [isVoice, textSocket.currentQuestion, turnVoice]);
 
+  // Text-mode orb energy: the socket's streaming flag never clears, so derive
+  // it here — energetic while token batches land, calm 1.5s after they stop
+  // (same settle behavior as voice mode's speech states).
+  useEffect(() => {
+    if (isVoice) return;
+    const q = textSocket.currentQuestion;
+    if (q && q !== lastQRef.current) {
+      lastQRef.current = q;
+      setTextSpeaking(true);
+    }
+    const t = window.setTimeout(() => setTextSpeaking(false), 1500);
+    return () => window.clearTimeout(t);
+  }, [isVoice, textSocket.currentQuestion]);
+
   // Active status based on mode
   const activeStatus = textSocket.status;
   const activeErrorMessage = isVoice
@@ -114,6 +135,16 @@ export default function StagePage({
     setIsVoice(false);
     router.push(`/stage/${sessionId}?n=${totalRounds}`);
   };
+
+  if (gateUser === undefined) {
+    return (
+      <div className="w-full max-w-7xl mx-auto px-4 py-6 space-y-4 animate-pulse">
+        <div className="h-16 bg-zinc-200 dark:bg-zinc-800 rounded-xl" />
+        <div className="h-48 bg-zinc-200 dark:bg-zinc-800 rounded-xl" />
+      </div>
+    );
+  }
+  if (gateUser === null) return <LoginGate />;
 
   return (
     <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 flex flex-col gap-6">
@@ -160,7 +191,8 @@ export default function StagePage({
             size={56}
             state={isVoice ? turnVoice.orbState : undefined}
             isActive={isConnected}
-            isSpeaking={isVoice ? turnVoice.orbState === "speaking" : textSocket.isStreamingQuestion}
+            isSpeaking={isVoice ? turnVoice.orbState === "speaking" : textSpeaking}
+            motion={isVoice ? "live" : "static"}
           />
           <div>
             <div className="flex items-center gap-2">

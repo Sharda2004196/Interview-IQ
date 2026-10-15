@@ -21,6 +21,7 @@ import base64
 import logging
 import os
 import secrets
+import threading
 import time
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,10 @@ log = logging.getLogger(__name__)
 _warned = False
 # session_id -> trace_id (one trace per interview, spans attach to it)
 _traces: dict[str, str] = {}
+# Fire-and-forget send threads: tracing must never sit on the interview's
+# critical path (a slow Langfuse day would slow every answer otherwise).
+_lock = threading.Lock()
+_pending: list[threading.Thread] = []
 
 
 class _Span:
@@ -83,6 +88,15 @@ def _any_value(v):
     if isinstance(v, (list, tuple)):
         return {"arrayValue": {"values": [_any_value(i) for i in v]}}
     return {"stringValue": "" if v is None else str(v)}
+
+
+def _send_async(path: str, payload: dict) -> None:
+    """Queue an HTTP send on a daemon thread; never blocks the caller."""
+    t = threading.Thread(target=_post, args=(path, payload), daemon=True)
+    with _lock:
+        _pending[:] = [p for p in _pending if p.is_alive()]
+        _pending.append(t)
+    t.start()
 
 
 def _post(path: str, payload: dict, timeout: float = 10.0) -> bool:
@@ -152,7 +166,7 @@ def start_span(session_id: str, name: str, input=None, metadata=None):
 
 
 def end_span(span, output=None, metadata=None, level: str = "DEFAULT"):
-    """Send the span (synchronous; ~200ms noise next to 10-60s LLM turns)."""
+    """Queue the span send (async thread, off the interview critical path)."""
     if span is None:
         return
     try:
@@ -180,7 +194,7 @@ def end_span(span, output=None, metadata=None, level: str = "DEFAULT"):
         }
         if span.parent_id:
             otlp_span["parentSpanId"] = span.parent_id
-        _post(
+        _send_async(
             "/api/public/otel/v1/traces",
             {"resourceSpans": [{"resource": {}, "scopeSpans": [{"scope": {}, "spans": [otlp_span]}]}]},
         )
@@ -196,7 +210,7 @@ def score_span(span, name: str, value: float):
         tid = span.trace_id if isinstance(span, _Span) else None
         if tid is None:
             return
-        _post(
+        _send_async(
             "/api/public/scores",
             {"traceId": tid, "name": name, "value": float(value)},
         )
@@ -204,8 +218,20 @@ def score_span(span, name: str, value: float):
         pass
 
 
-def flush():
-    """Synchronous sender: nothing buffered, nothing to flush (kept for API)."""
+def flush(timeout: float = 8.0):
+    """Wait (bounded) for queued sends — called on session end so no span is
+    lost to a container restart. Never raises, never blocks indefinitely."""
+    try:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with _lock:
+            pending = list(_pending)
+        for t in pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(timeout=remaining)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def drop_session(session_id: str) -> None:

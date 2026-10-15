@@ -6,10 +6,13 @@ import { ArrowRight, FileText, SpinnerGap, WarningCircle } from "@phosphor-icons
 import { ModePicker } from "@/components/ModePicker";
 import { PersonaPanel } from "@/components/PersonaPanel";
 import { createSession, type Mode, type Persona, type SessionConfig } from "@/lib/api";
+import { useFirebaseUser } from "@/lib/firebase";
+import { LoginGate } from "@/components/LoginGate";
 import { TOKENS } from "@/lib/tokens";
 
 export default function SetupPage() {
   const router = useRouter();
+  const user = useFirebaseUser();
 
   // Mode state
   const [mode, setMode] = useState<Mode>("A");
@@ -107,6 +110,17 @@ export default function SetupPage() {
       setIsSubmitting(false);
     }
   };
+
+  if (user === undefined) {
+    return (
+      <div className="w-full max-w-md mx-auto px-4 py-14 space-y-4 animate-pulse">
+        <div className="w-12 h-12 rounded-xl bg-zinc-200 dark:bg-zinc-800" />
+        <div className="h-8 bg-zinc-200 dark:bg-zinc-800 rounded w-3/4" />
+        <div className="h-12 bg-zinc-200 dark:bg-zinc-800 rounded-lg" />
+      </div>
+    );
+  }
+  if (user === null) return <LoginGate />;
 
   return (
     <div className="w-full max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 md:py-10 flex-1 flex flex-col justify-center">

@@ -9,6 +9,10 @@ interface OrbProps {
   rotateOnHover?: boolean;
   forceHoverState?: boolean;
   backgroundColor?: string;
+  // Static ring: freezes the morphing noise (fixed frame) while the ring
+  // itself keeps slowly rotating. Text mode uses this — presence without
+  // motion competing with reading.
+  frozen?: boolean;
 }
 
 export default function Orb({
@@ -16,9 +20,12 @@ export default function Orb({
   hoverIntensity = 0.2,
   rotateOnHover = true,
   forceHoverState = false,
-  backgroundColor = '#000000'
+  backgroundColor = '#000000',
+  frozen = false
 }: OrbProps) {
   const ctnDom = useRef<HTMLDivElement>(null);
+  const frozenRef = useRef(frozen);
+  frozenRef.current = frozen;
 
   const vert = /* glsl */ `
     precision highp float;
@@ -268,16 +275,19 @@ export default function Orb({
     let rafId: number;
     const update = (t: number) => {
       rafId = requestAnimationFrame(update);
+      const frozenNow = frozenRef.current;
+      // Frozen: hold one still frame (no morphing), keep the slow rotation.
+      // Hover input is ignored so the ring never warps under the cursor.
       const dt = (t - lastTime) * 0.001;
       lastTime = t;
-      program.uniforms.iTime.value = t * 0.001;
+      program.uniforms.iTime.value = frozenNow ? 0 : t * 0.001;
       program.uniforms.hue.value = hue;
-      program.uniforms.hoverIntensity.value = hoverIntensity;
+      program.uniforms.hoverIntensity.value = frozenNow ? 0 : hoverIntensity;
 
-      const effectiveHover = forceHoverState ? 1 : targetHover;
+      const effectiveHover = frozenNow ? 0 : forceHoverState ? 1 : targetHover;
       program.uniforms.hover.value += (effectiveHover - program.uniforms.hover.value) * 0.1;
 
-      if (rotateOnHover && effectiveHover > 0.5) {
+      if (rotateOnHover && (effectiveHover > 0.5 || frozenNow)) {
         currentRot += dt * rotationSpeed;
       }
       program.uniforms.rot.value = currentRot;
@@ -295,7 +305,7 @@ export default function Orb({
       container.removeChild(gl.canvas);
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     };
-  }, [hue, hoverIntensity, rotateOnHover, forceHoverState, backgroundColor]);
+  }, [hue, hoverIntensity, rotateOnHover, forceHoverState, backgroundColor, frozen]);
 
   return <div ref={ctnDom} className="w-full h-full" />;
 }

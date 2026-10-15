@@ -4,6 +4,7 @@ import React from "react";
 import Link from "next/link";
 import { Brain } from "@phosphor-icons/react";
 import { ThemeToggle } from "./ThemeToggle";
+import { AuthButton } from "./AuthButton";
 import { TOKENS } from "@/lib/tokens";
 
 export function AppHeader() {
@@ -32,6 +33,7 @@ export function AppHeader() {
             <span>Agent Live</span>
           </div>
           <ThemeToggle />
+          <AuthButton />
         </div>
       </div>
     </header>

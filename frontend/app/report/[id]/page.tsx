@@ -4,6 +4,8 @@ import React, { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { WarningCircle, ArrowClockwise, ArrowLeft } from "@phosphor-icons/react";
 import { getReport, type Report } from "@/lib/api";
+import { useFirebaseUser } from "@/lib/firebase";
+import { LoginGate } from "@/components/LoginGate";
 import { ReportView } from "@/components/ReportView";
 import { TOKENS } from "@/lib/tokens";
 
@@ -18,6 +20,7 @@ export default function ReportPage({
   const [report, setReport] = useState<Report | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const gateUser = useFirebaseUser();
 
   useEffect(() => {
     let isMounted = true;
@@ -64,6 +67,16 @@ export default function ReportPage({
       isMounted = false;
     };
   }, [sessionId]);
+
+  if (gateUser === undefined) {
+    return (
+      <div className="w-full max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-6 animate-pulse">
+        <div className="h-8 bg-zinc-200 dark:bg-zinc-800 rounded w-1/3" />
+        <div className="h-40 bg-zinc-200 dark:bg-zinc-800 rounded-xl" />
+      </div>
+    );
+  }
+  if (gateUser === null) return <LoginGate />;
 
   if (isLoading) {
     return (

@@ -12,6 +12,9 @@ export interface VoiceOrbProps {
   isActive?: boolean;
   isSpeaking?: boolean;
   className?: string;
+  // "live": full motion (voice mode). "static": frozen ring + slow rotation,
+  // no morphing ever (text mode — presence without competing with reading).
+  motion?: "live" | "static";
 }
 
 // Emerald hue for the WebGL orb (matches the emerald accent system).
@@ -23,6 +26,7 @@ export function VoiceOrb({
   isActive = true,
   isSpeaking = false,
   className = "",
+  motion = "live",
 }: VoiceOrbProps) {
   // Infer normalized state (unchanged contract — all callers keep working).
   const effectiveState: VoiceOrbState =
@@ -38,15 +42,16 @@ export function VoiceOrb({
       className={`relative ${TOKENS.radius.orb} shrink-0 overflow-hidden bg-zinc-200 dark:bg-zinc-950 border border-zinc-300 dark:border-white/15 shadow-sm select-none ${className}`}
       aria-label={`Interviewer status: ${effectiveState}`}
     >
-      {/* ReactBits Orb (ogl WebGL): intensity follows state. Idle drifts calmly,
-          listening brightens, speaking goes full energy + rotation. */}
+      {/* ReactBits Orb: live motion follows state in voice mode; text mode
+          holds one frozen frame with a slow rotation, permanently. */}
       <div className={`absolute inset-0 ${isIdle ? "opacity-60 saturate-50" : "opacity-100"}`}>
         <Orb
           hue={EMERALD_HUE}
-          hoverIntensity={isSpeech ? 0.9 : 0.35}
+          hoverIntensity={motion === "static" ? 0 : isSpeech ? 0.9 : 0.35}
           rotateOnHover={true}
-          forceHoverState={!isIdle}
+          forceHoverState={motion === "static" ? false : !isIdle}
           backgroundColor="#09090b"
+          frozen={motion === "static"}
         />
       </div>
 

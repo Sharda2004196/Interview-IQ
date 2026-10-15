@@ -55,11 +55,24 @@ export interface PastSession {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+// Firebase ID token when logged in; {} when logged out (backend falls back
+// to the shared dev identity — old behavior, unchanged).
+async function authHeaders(): Promise<Record<string, string>> {
+  try {
+    const { getIdToken } = await import("./firebase");
+    const token = await getIdToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
+}
+
 export async function getReport(sessionId: string): Promise<Report> {
   const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/report`, {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
+      ...(await authHeaders()),
     },
   });
 
@@ -76,6 +89,7 @@ export async function createSession(config: SessionConfig): Promise<CreateSessio
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...(await authHeaders()),
     },
     body: JSON.stringify(config),
   });
@@ -94,6 +108,7 @@ export async function uploadFile(file: File, namespace: string): Promise<UploadR
 
   const res = await fetch(`${API_BASE}/upload?namespace=${encodeURIComponent(namespace)}`, {
     method: "POST",
+    headers: await authHeaders(),
     body: formData,
   });
 
@@ -110,6 +125,7 @@ export async function getSessions(): Promise<PastSession[]> {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
+      ...(await authHeaders()),
     },
   });
 
@@ -124,6 +140,7 @@ export async function getSessions(): Promise<PastSession[]> {
 export async function deleteSession(sessionId: string): Promise<void> {
   const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}`, {
     method: "DELETE",
+    headers: await authHeaders(),
   });
 
   if (!res.ok) {
@@ -135,6 +152,7 @@ export async function deleteSession(sessionId: string): Promise<void> {
 export async function deleteAllSessions(): Promise<number> {
   const res = await fetch(`${API_BASE}/sessions`, {
     method: "DELETE",
+    headers: await authHeaders(),
   });
 
   if (!res.ok) {
