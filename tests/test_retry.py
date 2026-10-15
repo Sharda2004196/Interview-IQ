@@ -106,7 +106,7 @@ def test_clean_miss_replays_once_then_scores(monkeypatch):
     monkeypatch.setattr(M, "stream_reply", _fake_reply)
     monkeypatch.setattr(M, "RETRY_DELAY_S", 0.01)
 
-    async def fake_save(sid, scores, config):
+    async def fake_save(sid, scores, config, user_id=""):
         saved["scores"] = list(scores)
 
     monkeypatch.setattr(M, "_ensure_final_save", fake_save)

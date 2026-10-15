@@ -201,6 +201,8 @@ async def interview_ws(websocket: WebSocket, session_id: str):
             for start_attempt in range(2):
                 q0 = await snapshot_qindex(session_id, ws_user)
                 q1_saw_output = False
+                st0 = asyncio.get_event_loop().time()
+                waited_start = 0.0
                 try:
                     async for delta in stream_reply(session_id, _start_prompt(config), ws_user):
                         q1_saw_output = True
@@ -222,6 +224,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         if await _sleep_or_gone(websocket, RETRY_DELAY_QUICK_S):
                             lf_end_span(start_span, output={"status": "abandoned-client-gone"})
                             return
+                        waited_start += RETRY_DELAY_QUICK_S
                         continue
                     lf_end_span(
                         start_span,
@@ -234,7 +237,14 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         WSError(message=f"Start failed ({type(ex).__name__}); retry.").model_dump_json(),
                     )
                     return
-            lf_end_span(start_span, output={"q1": "".join(q1_parts)})
+            lf_end_span(
+                start_span,
+                output={"q1": "".join(q1_parts)},
+                metadata={
+                    "duration_s": round(asyncio.get_event_loop().time() - st0 - waited_start, 2),
+                    "waited_s": round(waited_start, 2),
+                },
+            )
         except WebSocketDisconnect:
             return  # client hung up mid-stream; nothing to report to
         except Exception as ex:  # noqa: BLE001 — one bad turn must not kill the interview
@@ -324,6 +334,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 answer_text = msg.get("text", "") or ""
                 round_no = len(rounds) + 1
                 t0 = asyncio.get_event_loop().time()
+                waited = 0.0  # retry-sleep excluded from duration_s below
                 span = lf_start_span(
                     session_id,
                     f"round-{round_no}-attempt-{attempt}",
@@ -366,6 +377,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         await restore_qindex(session_id, ws_user, q0)
                         if await _sleep_or_gone(websocket, RETRY_DELAY_S):
                             return  # client left mid-retry; nothing to replay for
+                        waited += RETRY_DELAY_S
                         continue
                     if _is_quota_error(ex):
                         message = (
@@ -388,7 +400,10 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 lf_end_span(
                     span,
                     output={"scored": turn_scored, "signal": turn_signal},
-                    metadata={"duration_s": round(asyncio.get_event_loop().time() - t0, 2)},
+                    metadata={
+                        "duration_s": round(asyncio.get_event_loop().time() - t0 - waited, 2),
+                        "waited_s": round(waited, 2),
+                    },
                 )
                 # End ONLY on closed rounds: len(rounds) >= N with no open probe.
                 # Backfill saves rounds only, so the report always shows exactly N.
