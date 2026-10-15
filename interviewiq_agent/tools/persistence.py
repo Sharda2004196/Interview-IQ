@@ -96,6 +96,7 @@ def save_score(
     nudge_reason: str = "",
     mode: str = "",
     topic: str = "",
+    user_id: str = "",
     tool_context: ToolContext | None = None,
 ) -> dict:
     """Persist scores. Overall is COMPUTED here (weighted mean + bounded nudge),
@@ -103,13 +104,17 @@ def save_score(
 
     mode/topic feed Past Reports listing (agent passes what it knows; the
     backend backfill passes session config). created_at orders the list.
+    user_id pins the owner: the agent's tool call resolves it from session
+    state; the backend backfill passes the socket's uid explicitly (it has no
+    ToolContext, and must NOT fall back to the shared dev identity, or the
+    report becomes invisible to a logged-in owner).
     """
     from firebase_admin import firestore as _fs
 
     overall = weighted_overall(per_question, difficulties, nudge)
     _db().collection("scores").document(session_id).set(
         {
-            "user_id": _uid(tool_context),
+            "user_id": user_id or _uid(tool_context),
             "per_question": per_question,
             "difficulties": difficulties,
             "nudge": nudge,

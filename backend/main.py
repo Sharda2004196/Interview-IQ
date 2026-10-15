@@ -123,12 +123,16 @@ async def _sleep_or_gone(websocket: WebSocket, seconds: float) -> bool:
         await asyncio.sleep(min(1.0, remaining))
 
 
-async def _ensure_final_save(session_id: str, scores: list, config: SessionConfig) -> None:
+async def _ensure_final_save(
+    session_id: str, scores: list, config: SessionConfig, user_id: str = ""
+) -> None:
     """Backfill the Firestore score doc when the agent presented the report
     without calling save_score (Lite skips it at turn end). Never overwrites
     an agent-made save (which carries real difficulties + nudge); the backfill
     uses session-level difficulty and nudge 0. Always merge-fills mode/topic
-    so Past Reports listing works on agent-saved docs too."""
+    so Past Reports listing works on agent-saved docs too.
+    user_id pins ownership to the socket owner — NEVER the shared dev
+    identity, or a logged-in owner's report vanishes from their list."""
     import asyncio
 
     from interviewiq_agent.tools.persistence import _db, fill_report_meta, save_score
@@ -147,6 +151,7 @@ async def _ensure_final_save(session_id: str, scores: list, config: SessionConfi
                 [diff] * len(scores),
                 mode=config.mode,
                 topic=config.topic,
+                user_id=user_id,
             )
         except Exception:
             pass  # report page falls back; never break the signal on save error
@@ -295,7 +300,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 # Same safety net as auto-end: if the agent's own save failed
                 # or was skipped, persist the rounds actually scored (empty when
                 # nothing was answered — an honest 0, not a lost score).
-                await _ensure_final_save(session_id, rounds, config)
+                await _ensure_final_save(session_id, rounds, config, ws_user)
                 _drop_session_state(session_id)
                 lf_flush()
                 lf_drop_session(session_id)
@@ -392,7 +397,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     and not _probe_open[session_id]
                     and len(rounds) >= config.num_questions
                 ):
-                    await _ensure_final_save(session_id, rounds, config)
+                    await _ensure_final_save(session_id, rounds, config, ws_user)
                     await _send_safe(websocket, '{"type":"report"}')
                     _drop_session_state(session_id)
                     lf_flush()
