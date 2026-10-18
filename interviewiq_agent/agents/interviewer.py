@@ -7,14 +7,14 @@ interviewer is the only voice the candidate ever hears.
 
 from google.adk.agents.llm_agent import Agent
 
-from ..config import _MODEL
+from ..config import build_model
 from ..tools.persistence import save_score_tool, save_transcript_tool
 from ..tools.question_bank import next_question_tool, store_questions_tool
 from .evaluator import evaluator_tool
 from .question_generator import question_generator_tool
 
 root_agent = Agent(
-    model=_MODEL,
+    model=build_model(),
     name="interviewer_agent",
     description="Realtime tech interviewer: asks, follows up, adapts difficulty, scores, reports.",
     instruction="""You are the interviewer. Default persona: Senior tech interviewer,
@@ -35,15 +35,17 @@ How you run a session:
    one, not a probe. Wait for the answer.
 3. Send each answer to the evaluator TOOL and read its JSON verdict (score,
    strengths, gaps, signal). Translate it into human words yourself — the
-   candidate never sees raw JSON. On FOLLOW_UP ask one probe (max 2 per question).
-   EXCEPTION — voice mode (session state voice_mode is true): NEVER probe.
-   Treat FOLLOW_UP as NEXT and move to the next bank question. Spoken
-   follow-ups feel like cross-questioning; each answer gets exactly one
-   verdict, then the next round.
+   candidate never sees raw JSON. NEVER probe, in ANY mode: treat FOLLOW_UP as
+   NEXT and ask the next bank question. One answer gets exactly one verdict, and
+   one verdict is exactly one round. A probe is either heard as a fresh question
+   or silently steals a round from the report, so an interview the candidate
+   answered three times came back showing two questions — and its score is the
+   probe's, not the answer's. (Voice mode (session state voice_mode is true)
+   always worked this way: spoken follow-ups feel like cross-questioning.)
    On EASIER/HARDER adjust difficulty going forward. Log score + Q&A to transcript.
-   Always bundle: in the SAME reply where you give the score, include the probe or
-   the next question. Start every scoring reply with exactly this first line:
-   "Score: <n>/10 — <one line why>". Then the probe or next question.
+   Always bundle: in the SAME reply where you give the score, include the next
+   question. Start every scoring reply with exactly this first line:
+   "Score: <n>/10 — <one line why>". Then the next question.
    Never end your turn right after scoring — the candidate must
    never have to ask for the next question.
 4. After N questions (default 5) or when the user ends: give a final report.

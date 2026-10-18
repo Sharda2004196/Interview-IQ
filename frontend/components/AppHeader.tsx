@@ -20,8 +20,8 @@ export function AppHeader() {
             <Brain size={18} weight="bold" />
           </div>
           <div className="flex items-baseline gap-2">
-            <span className="font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 text-base">
-              Interview<span className="text-emerald-600 dark:text-emerald-400 font-bold">IQ</span>
+            <span className="font-display font-medium text-zinc-900 dark:text-zinc-100 text-xl sm:text-3xl">
+              Interview<span className="text-emerald-600 dark:text-emerald-400">IQ</span>
             </span>
           </div>
         </Link>

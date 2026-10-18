@@ -12,6 +12,8 @@ import {
 } from "@phosphor-icons/react";
 import { useInterviewSocket } from "@/lib/useInterviewSocket";
 import { useTurnVoice } from "@/lib/useTurnVoice";
+import { spokenText } from "@/lib/spokenText";
+import { questionText } from "@/lib/questionText";
 import { useFirebaseUser } from "@/lib/firebase";
 import { LoginGate } from "@/components/LoginGate";
 import VoicePill from "@/components/bits/VoicePill";
@@ -72,10 +74,19 @@ export default function StagePage({
   const lastSpokenRef = useRef<string>("");
   const latestQuestionRef = useRef<string>("");
   latestQuestionRef.current = textSocket.currentQuestion;
+  // The card shows the QUESTION and nothing else. A turn's raw text also carries
+  // the agent's own "Welcome to your … interview!" preamble, the mandated
+  // "Score: …" line, and — on the final turn, or a reconnect resync — the whole
+  // written report. All display filtering lives in lib/questionText.ts; the
+  // socket, transcript and report are untouched.
+  const shownQuestion = questionText(textSocket.currentQuestion);
 
   // Speak each settled question aloud. Settle-debounce (not the socket's
   // streaming flag — it never clears): streaming batches reset the timer,
   // speech fires 1.5s after the last batch lands, exactly once per question.
+  // Only the QUESTION is spoken: the mandatory "Score: …" line is stripped and
+  // the final report is skipped entirely (spokenText), so voice mode stops
+  // narrating the score and the full report after every round.
   useEffect(() => {
     if (!isVoice) return;
     const q = textSocket.currentQuestion;
@@ -83,7 +94,8 @@ export default function StagePage({
     const t = window.setTimeout(() => {
       if (latestQuestionRef.current === q && lastSpokenRef.current !== q) {
         lastSpokenRef.current = q;
-        turnVoice.speak(q);
+        const spoken = spokenText(q);
+        if (spoken) turnVoice.speak(spoken);
       }
     }, 1500);
     return () => window.clearTimeout(t);
@@ -299,16 +311,19 @@ export default function StagePage({
               </div>
             </div>
             <QuestionCard
-              question={textSocket.currentQuestion}
+              question={shownQuestion}
               turnIndex={displayIndex}
               totalQuestions={totalRounds}
               isStreaming={textSocket.isStreamingQuestion || isConnecting}
-              onReplay={() => turnVoice.speak(textSocket.currentQuestion, false)}
+              onReplay={() => {
+                const spoken = spokenText(textSocket.currentQuestion);
+                if (spoken) turnVoice.speak(spoken, false);
+              }}
             />
             </>
           ) : (
             <QuestionCard
-              question={textSocket.currentQuestion}
+              question={shownQuestion}
               turnIndex={displayIndex}
               totalQuestions={totalRounds}
               isStreaming={textSocket.isStreamingQuestion || isConnecting}

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -28,8 +29,11 @@ from .runner import (
     _is_quota_error,
     _is_retryable,
     bank_exhausted,
+    build_retry_prompt,
     build_start_prompt,
     get_or_create_session,
+    interview_started,
+    question_bank,
     restore_qindex,
     snapshot_qindex,
     stream_events,
@@ -82,15 +86,87 @@ _pending_configs: dict[str, tuple[SessionConfig, str]] = {}
 # restart wipes both anyway); entries are deleted on either end path.
 _rounds: dict[str, list[float]] = {}
 _probe_open: dict[str, bool] = {}
+# Backend-owned report content: per-turn evaluator strengths/gaps + the raw
+# answers behind them, keyed by ROUND (not by attempt — replays overwrite the
+# same round idempotently) and excluding probe turns (clarifications are not
+# rounds). The agent is ASKED to persist these via save_score but Lite
+# routinely skips the call — these stores let the report endpoint enrich
+# (or backfill) from code truth instead of hoping for obedience.
+_eval_notes: dict[str, list[dict]] = {}
+_answers: dict[str, dict[int, str]] = {}
+# Round -> question TEXT, captured from next_question's bank frames (exact bank
+# wording, 1-based index). Without this the transcript has answers but no
+# questions, because nothing else records what was asked per round.
+_questions: dict[str, dict[int, str]] = {}
+# The agent's OWN final report text, parsed into the five report fields. This
+# is exactly what the candidate saw on screen (adk-web parity) and is the
+# highest-fidelity source — used before evaluator notes and the summarizer.
+_report_parsed: dict[str, dict] = {}
+# Sessions with an enrichment pass in flight. Prevents the finish-path pass and
+# a concurrent report-page GET from both running the (slow) summarizer.
+_enriching: set[str] = set()
+# Last streamed turn text per session — used to RESYNC the stage page on socket
+# reconnect instead of re-driving the model (which duplicates the conversation).
+# _start_tries bounds how many start-family messages a session may accumulate.
+_last_turn_text: dict[str, str] = {}
+_start_tries: dict[str, int] = {}
 
 
 def _drop_session_state(session_id: str) -> None:
     _rounds.pop(session_id, None)
     _probe_open.pop(session_id, None)
+    _eval_notes.pop(session_id, None)
+    _answers.pop(session_id, None)
+    _questions.pop(session_id, None)
+    _report_parsed.pop(session_id, None)
+    _last_turn_text.pop(session_id, None)
+    _start_tries.pop(session_id, None)
 
 
 async def _remember_config(session_id: str, config: SessionConfig, user_id: str):
     _pending_configs[session_id] = (config, user_id)
+
+
+async def _maybe_finish_interview(
+    websocket: WebSocket,
+    session_id: str,
+    rounds: list,
+    config: SessionConfig,
+    ws_user: str,
+    turn_scored: bool,
+    reported: bool,
+) -> bool:
+    """Shared end-of-interview check for success AND failure paths.
+
+    A turn can score and THEN die (reply generation 503s after the verdict).
+    Without this shared check, the failure path breaks out and strands a
+    completed interview on an error banner. Returns True when ended.
+    """
+    close_normally = (
+        turn_scored
+        and not _probe_open.get(session_id, False)
+        and len(rounds) >= config.num_questions
+    )
+    # `reported` is the agent's own "Verdict:" line — a signal that does NOT
+    # depend on any tool firing. Lite sometimes writes the whole report as text
+    # without calling the evaluator or next_question; gating this on turn_scored
+    # stranded a finished interview on the stage page with the report on screen.
+    if not (close_normally or reported):
+        return False
+    await _ensure_final_save(session_id, rounds, config, ws_user)
+    # Transcript BEFORE _drop_session_state (it wipes _rounds/_answers/_questions).
+    await _persist_transcript(session_id, config, ws_user)
+    await _send_safe(websocket, '{"type":"report"}')
+    # Enrich the doc BEFORE dropping state. _eval_notes/_answers live only in
+    # memory and _drop_session_state empties them, so a report-page GET arriving
+    # after the drop can never enrich — that ordering was the bug behind the
+    # same three cards in every session. Sent after the signal so navigation is
+    # instant; the page polls for the text fields while this lands.
+    await _finalize_enrichment(session_id)
+    _drop_session_state(session_id)
+    lf_flush()
+    lf_drop_session(session_id)
+    return True
 
 
 def _start_prompt(config: SessionConfig) -> str:
@@ -139,7 +215,32 @@ async def _ensure_final_save(
 
     def _write():
         try:
-            if _db().collection("scores").document(session_id).get().exists:
+            from interviewiq_agent.tools.persistence import weighted_overall
+
+            ref = _db().collection("scores").document(session_id)
+            snap = ref.get()
+            if snap.exists:
+                data = snap.to_dict() or {}
+                if not data.get("per_question") and scores:
+                    # Hollow agent save (empty per_question → overall 0.0). The
+                    # rounds we actually scored are the truth. Merge ONLY the
+                    # score fields so text the agent saved survives; the
+                    # enrichment pass right after fills the rest.
+                    diff = config.persona.difficulty
+                    vals = [float(s) for s in scores]
+                    diffs = [diff] * len(vals)
+                    ref.set(
+                        {
+                            "per_question": vals,
+                            "difficulties": diffs,
+                            "overall": weighted_overall(vals, diffs, 0.0),
+                            "mode": config.mode,
+                            "topic": config.topic,
+                            "user_id": data.get("user_id") or user_id,
+                        },
+                        merge=True,
+                    )
+                    return
                 fill_report_meta(session_id, config.mode, config.topic)
                 return
             if not scores:
@@ -157,6 +258,132 @@ async def _ensure_final_save(
             pass  # report page falls back; never break the signal on save error
 
     await asyncio.to_thread(_write)
+
+
+def _build_turns(
+    rounds: list,
+    bank: list[str],
+    captured: dict[int, str],
+    answers: dict[int, str],
+) -> list[dict]:
+    """Pair each scored round with its question and answer.
+
+    Pure so it can be tested without Firestore. `bank` (stored at setup) wins
+    over `captured` (next_question frames) for the question column; a round with
+    neither question nor answer is dropped rather than written as an empty card.
+    """
+    turns: list[dict] = []
+    for idx, score_value in enumerate(rounds):
+        q_text = (bank[idx] if idx < len(bank) else captured.get(idx, "")).strip()
+        a_text = (answers.get(idx) or "").strip()
+        if not q_text and not a_text:
+            continue
+        try:
+            turn_score = float(score_value)
+        except (TypeError, ValueError):
+            turn_score = 0.0
+        turns.append({"q": q_text, "a": a_text, "score": turn_score})
+    return turns
+
+
+async def _persist_transcript(
+    session_id: str, config: SessionConfig, user_id: str = ""
+) -> None:
+    """Backend-owned transcript: rounds -> sessions/{id}.turns in Firestore.
+
+    Same reasoning as _ensure_final_save: the agent is ASKED to call
+    save_transcript, but Lite skips it at turn end. Verified against live
+    Firestore — 25 sessions had scores docs and only 8 toy docs existed in
+    `sessions`, none for a real sess-* id — so the report PDF's Q&A section was
+    always empty. Code truth instead: questions from the stored bank (falling
+    back to captured next_question frames), answers from _answers, scores from
+    _rounds. Probe turns never open a round, so they are excluded by
+    construction. user_id pins ownership to the socket owner — NEVER the shared
+    dev identity, or a logged-in owner's transcript is invisible to them.
+    """
+    import asyncio
+
+    rounds = list(_rounds.get(session_id, []))
+    if not rounds:
+        return
+    bank = await question_bank(session_id, user_id)
+    turns = _build_turns(
+        rounds, bank, _questions.get(session_id, {}), _answers.get(session_id, {})
+    )
+    if not turns:
+        return
+
+    def _write():
+        try:
+            from interviewiq_agent.tools.persistence import save_transcript
+
+            save_transcript(
+                session_id,
+                mode=config.mode,
+                difficulty=config.persona.difficulty,
+                turns=turns,
+                user_id=user_id,
+            )
+        except Exception:
+            pass  # transcript is additive; never break the report signal
+
+    await asyncio.to_thread(_write)
+
+
+def _effective_signal(sig: str | None) -> str | None:
+    """Probes are disabled in EVERY mode, so a FOLLOW_UP vote is a closed round.
+
+    A probe used to open a round that only the next verdict closed, which meant
+    two of a candidate's answers could fold into one round and the report showed
+    fewer questions than were answered (3 answers -> "2 Questions", with the
+    round carrying the PROBE's score and the original answer's text). The
+    interviewer is now instructed never to probe (interviewer.py:39), and this
+    normalization guarantees it even if the evaluator still votes FOLLOW_UP:
+    one answer -> one verdict -> one round, in text and voice alike.
+    """
+    if sig == "FOLLOW_UP":
+        return "NEXT"
+    return sig
+
+
+def _apply_verdict(
+    rounds: list,
+    answers: dict,
+    probe_open: bool,
+    value: float,
+    sig: str | None,
+    answer_text: str,
+) -> bool:
+    """Fold one evaluator verdict into the round bookkeeping; returns the new
+    probe_open flag.
+
+    Round-truth: rounds are closed non-FOLLOW_UP verdicts. A FOLLOW_UP opens the
+    question's round with a provisional score (so a probe the candidate never
+    answered still leaves a round, not a 0.0 "No Hire"); the next verdict closes
+    it by overwriting — never appending, or one question would count twice.
+    Answers are pinned to their round at APPEND time, keyed by round index, so a
+    replay overwrites identically.
+    """
+    if sig == "FOLLOW_UP":
+        if not probe_open:
+            rounds.append(value)
+            _pin_answer(answers, len(rounds) - 1, answer_text)
+            return True
+        if rounds:
+            rounds[-1] = value  # 2nd probe: latest wins
+        return True
+    if probe_open:
+        if rounds:
+            rounds[-1] = value  # closes the probe: same question, latest score
+        return False
+    rounds.append(value)
+    _pin_answer(answers, len(rounds) - 1, answer_text)
+    return False
+
+
+def _pin_answer(answers: dict, index: int, answer_text: str) -> None:
+    if answer_text.strip():
+        answers[index] = answer_text.strip()[:2000]
 
 
 @app.websocket("/ws/{session_id}")
@@ -187,64 +414,98 @@ async def interview_ws(websocket: WebSocket, session_id: str):
         turn_meta = {"mode": config.mode, "user": ws_user, "socket": "text"}
         try:
             q1_parts: list[str] = []
-            start_span = lf_start_span(
-                session_id,
-                "turn-0-start",
-                input={"mode": config.mode, "topic": config.topic,
-                        "num_questions": config.num_questions},
-                metadata=turn_meta,
-            )
-            # Start-turn burst protection (same clean-miss rule as answer turns):
-            # a 503/429 before ANY token streamed replays Q1 silently after a
-            # short wait. Without this, Google capacity blips kill Q1 and force
-            # a manual Retry that regenerates everything from scratch.
-            for start_attempt in range(2):
-                q0 = await snapshot_qindex(session_id, ws_user)
-                q1_saw_output = False
-                st0 = asyncio.get_event_loop().time()
-                waited_start = 0.0
-                try:
-                    async for delta in stream_reply(session_id, _start_prompt(config), ws_user):
-                        q1_saw_output = True
-                        q1_parts.append(delta)
-                        await websocket.send_text(WSToken(text=delta).model_dump_json())
-                    break
-                except WebSocketDisconnect:
-                    lf_end_span(start_span, output={"status": "client-disconnected"})
-                    return  # client hung up mid-stream; nothing to report to
-                except Exception as ex:  # noqa: BLE001 — replay once, else honest error
-                    if _is_retryable(ex) and start_attempt == 0 and not q1_saw_output:
-                        lf_end_span(
-                            start_span,
-                            output={"status": "superseded-by-replay"},
-                            metadata={"error": f"{type(ex).__name__}: {ex}"},
-                            level="WARNING",
-                        )
-                        await restore_qindex(session_id, ws_user, q0)
-                        if await _sleep_or_gone(websocket, RETRY_DELAY_QUICK_S):
-                            lf_end_span(start_span, output={"status": "abandoned-client-gone"})
-                            return
-                        waited_start += RETRY_DELAY_QUICK_S
-                        continue
-                    lf_end_span(
-                        start_span,
-                        output={"status": "failed"},
-                        metadata={"error": f"{type(ex).__name__}: {ex}"},
-                        level="ERROR",
+            if await interview_started(session_id, ws_user):
+                # The interview already began — this is a reconnect (or a second
+                # handler after a drop). Re-driving the start prompt here appends
+                # a SECOND setup message to the SAME ADK session (ADK persists
+                # the user message before the model call), so the agent reads the
+                # candidate as "repeating the setup prompt" and bails with a
+                # bogus 0/10 No-Hire report. Resync the screen instead.
+                resume = _last_turn_text.get(session_id)
+                if resume:
+                    await _send_safe(
+                        websocket, json.dumps({"type": "question", "text": resume})
                     )
+            else:
+                start_tries = _start_tries.get(session_id, 0)
+                if start_tries >= 4:
+                    # Several failed start messages are already in the session;
+                    # one more reads as spam and tempts the agent into inventing
+                    # a report to escape. Fail honestly instead.
                     await _send_safe(
                         websocket,
-                        WSError(message=f"Start failed ({type(ex).__name__}); retry.").model_dump_json(),
+                        WSError(
+                            message="The interviewer is temporarily unavailable "
+                            "(model capacity). Please start a new interview."
+                        ).model_dump_json(),
                     )
                     return
-            lf_end_span(
-                start_span,
-                output={"q1": "".join(q1_parts)},
-                metadata={
-                    "duration_s": round(asyncio.get_event_loop().time() - st0 - waited_start, 2),
-                    "waited_s": round(waited_start, 2),
-                },
-            )
+                _start_tries[session_id] = start_tries + 1
+                start_span = lf_start_span(
+                    session_id,
+                    "turn-0-start",
+                    input={"mode": config.mode, "topic": config.topic,
+                            "num_questions": config.num_questions},
+                    metadata=turn_meta,
+                )
+                # Start-turn burst protection (same clean-miss rule as answer
+                # turns): a 503/429 before ANY token streamed replays after a
+                # short wait. The replay uses a NUDGE that says "continue", never
+                # the verbatim start prompt (already in the session).
+                for start_attempt in range(2):
+                    q0 = await snapshot_qindex(session_id, ws_user)
+                    q1_saw_output = False
+                    st0 = asyncio.get_event_loop().time()
+                    waited_start = 0.0
+                    try:
+                        async for delta in stream_reply(
+                            session_id,
+                            _start_prompt(config)
+                            if start_attempt == 0
+                            else build_retry_prompt("start"),
+                            ws_user,
+                        ):
+                            q1_saw_output = True
+                            q1_parts.append(delta)
+                            await websocket.send_text(WSToken(text=delta).model_dump_json())
+                        break
+                    except WebSocketDisconnect:
+                        lf_end_span(start_span, output={"status": "client-disconnected"})
+                        return  # client hung up mid-stream; nothing to report to
+                    except Exception as ex:  # noqa: BLE001 — replay once, else honest error
+                        if _is_retryable(ex) and start_attempt == 0 and not q1_saw_output:
+                            lf_end_span(
+                                start_span,
+                                output={"status": "superseded-by-replay"},
+                                metadata={"error": f"{type(ex).__name__}: {ex}"},
+                                level="WARNING",
+                            )
+                            await restore_qindex(session_id, ws_user, q0)
+                            if await _sleep_or_gone(websocket, RETRY_DELAY_QUICK_S):
+                                lf_end_span(start_span, output={"status": "abandoned-client-gone"})
+                                return
+                            waited_start += RETRY_DELAY_QUICK_S
+                            continue
+                        lf_end_span(
+                            start_span,
+                            output={"status": "failed"},
+                            metadata={"error": f"{type(ex).__name__}: {ex}"},
+                            level="ERROR",
+                        )
+                        await _send_safe(
+                            websocket,
+                            WSError(message=f"Start failed ({type(ex).__name__}); retry.").model_dump_json(),
+                        )
+                        return
+                _last_turn_text[session_id] = "".join(q1_parts)
+                lf_end_span(
+                    start_span,
+                    output={"q1": "".join(q1_parts)},
+                    metadata={
+                        "duration_s": round(asyncio.get_event_loop().time() - st0 - waited_start, 2),
+                        "waited_s": round(waited_start, 2),
+                    },
+                )
         except WebSocketDisconnect:
             return  # client hung up mid-stream; nothing to report to
         except Exception as ex:  # noqa: BLE001 — one bad turn must not kill the interview
@@ -311,6 +572,8 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 # or was skipped, persist the rounds actually scored (empty when
                 # nothing was answered — an honest 0, not a lost score).
                 await _ensure_final_save(session_id, rounds, config, ws_user)
+                await _persist_transcript(session_id, config, ws_user)
+                await _finalize_enrichment(session_id)
                 _drop_session_state(session_id)
                 lf_flush()
                 lf_drop_session(session_id)
@@ -331,6 +594,12 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 guard = pre_exhausted or final_turn
                 q0 = await snapshot_qindex(session_id, ws_user)
                 turn_scored, turn_signal, saw_output = False, None, False
+                bank_done = False
+                saw_verdict = False  # "Verdict:" streamed with bank exhausted =
+                turn_tail = ""  # agent reported instead of probing; end below
+                # Raw text for THIS turn — parsed into report fields at turn
+                # end so a report written without tools still lands + routes.
+                turn_text: list[str] = []
                 answer_text = msg.get("text", "") or ""
                 round_no = len(rounds) + 1
                 t0 = asyncio.get_event_loop().time()
@@ -342,27 +611,69 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     metadata={**turn_meta, "round": round_no, "attempt": attempt},
                 )
                 try:
-                    events = stream_events(session_id, answer_text, ws_user)
+                    events = stream_events(
+                        session_id,
+                        answer_text if attempt == 0 else build_retry_prompt("answer"),
+                        ws_user,
+                    )
                     async for kind, payload in events:
                         if kind == "score":
                             turn_scored = True
                             saw_output = True
                             value, sig = payload  # (float, signal|None)
-                            turn_signal = sig
-                            if sig == "FOLLOW_UP":
-                                _probe_open[session_id] = True
-                            else:
-                                _probe_open[session_id] = False
-                                rounds.append(value)
+                            turn_signal = _effective_signal(sig)
+                            # Replay-safe: re-folding the same verdict yields the
+                            # same rounds/answers, so a retried turn can't double
+                            # count.
+                            _probe_open[session_id] = _apply_verdict(
+                                rounds,
+                                _answers.setdefault(session_id, {}),
+                                _probe_open.get(session_id, False),
+                                value,
+                                turn_signal,
+                                answer_text,
+                            )
                             lf_score_span(span, "round_score", value)
                             await websocket.send_text(WSScore(value=value).model_dump_json())
+                        elif kind == "eval":
+                            # Evaluator's own words — backend-owned report content
+                            # (survives even when the agent skips save_score).
+                            _eval_notes.setdefault(session_id, []).append(payload)
                         elif kind == "bank":
+                            bank_done = bool(payload.get("done"))
+                            # Capture the exact bank question for its round
+                            # (index is 1-based). This is the ONLY place the
+                            # question text is recorded — the report parser sees
+                            # the turn text, not per-round questions.
+                            q_text = (payload.get("question") or "").strip()
+                            try:
+                                q_idx = int(payload.get("index", 0)) - 1
+                            except (TypeError, ValueError):
+                                q_idx = -1
+                            if q_text and q_idx >= 0:
+                                _questions.setdefault(session_id, {})[q_idx] = q_text
                             continue  # state reads cover exhaustion; no action needed
-                        elif guard and turn_signal != "FOLLOW_UP":
-                            continue
-                        else:
+                        elif kind == "token":
+                            # Capture ALWAYS — even when the final-turn guard
+                            # swallows display. The report parser needs the
+                            # text, and a swallowed report must still route.
+                            turn_text.append(payload)
+                            # Verdict marker survives chunk splits: check the
+                            # previous tail JOINED with this chunk, then keep
+                            # only the tail (a marker fully inside one chunk
+                            # must not be truncated away before the check).
+                            # The interviewer MUST end every report with a
+                            # "Verdict:" line and never writes it elsewhere.
+                            combined = (turn_tail + payload).lower()
+                            if "verdict:" in combined:
+                                saw_verdict = True
+                            turn_tail = (turn_tail + payload)[-16:]
+                            if guard and turn_signal != "FOLLOW_UP" and not saw_verdict:
+                                continue  # hide phantom question text; still parsed
                             saw_output = True
                             await websocket.send_text(WSToken(text=payload).model_dump_json())
+                        else:
+                            continue
                 except WebSocketDisconnect:
                     lf_end_span(span, output={"status": "client-disconnected"})
                     return
@@ -386,17 +697,69 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                         )
                     else:
                         message = f"Turn failed ({type(ex).__name__}); resend answer."
+                    # Unswallowed traceback: this path silently turned real bugs
+                    # into a one-line user message, which is why a mid-interview
+                    # TypeError was invisible in `docker logs` and looked like
+                    # "the interview just stopped early".
+                    import logging as _logging
+
+                    _logging.getLogger(__name__).exception(
+                        "turn failed session=%s type=%s scored=%s",
+                        session_id,
+                        type(ex).__name__,
+                        turn_scored,
+                    )
                     lf_end_span(
                         span,
                         output={"status": "failed"},
                         metadata={"error": f"{type(ex).__name__}: {ex}"},
                         level="ERROR",
                     )
+                    # Same text adoption as the clean path: an agent that wrote
+                    # the report and THEN 503'd still has a routable report.
+                    parsed = _parse_report_text("".join(turn_text)) if turn_text else {}
+                    if saw_verdict and parsed:
+                        _report_parsed[session_id] = parsed
+                    if not turn_scored and parsed.get("score") is not None:
+                        turn_scored = True
+                        rounds.append(parsed["score"])
+                        if answer_text.strip():
+                            _answers.setdefault(session_id, {})[len(rounds) - 1] = (
+                                answer_text.strip()[:2000]
+                            )
+                    # Scored-then-died: the verdict already landed (badge is up,
+                    # round counted) and only the reply text 503'd. If rounds
+                    # are complete — or the agent already showed its Verdict
+                    # line — END instead of stranding on an error banner.
+                    if await _maybe_finish_interview(
+                        websocket, session_id, rounds, config, ws_user,
+                        turn_scored=turn_scored, reported=saw_verdict,
+                    ):
+                        return
                     await _send_safe(
                         websocket,
                         WSError(message=message).model_dump_json(),
                     )
                     break
+                # Adopt the agent's OWN report text. Parsing it lets the report
+                # show exactly what the candidate saw, and rescues the score
+                # when the evaluator tool never fired (rounds would stay empty).
+                if turn_text:
+                    _last_turn_text[session_id] = "".join(turn_text)
+                parsed = _parse_report_text("".join(turn_text)) if turn_text else {}
+                if saw_verdict and parsed:
+                    _report_parsed[session_id] = parsed
+                if not turn_scored and parsed.get("score") is not None:
+                    turn_scored = True
+                    rounds.append(parsed["score"])
+                    if answer_text.strip():
+                        _answers.setdefault(session_id, {})[len(rounds) - 1] = (
+                            answer_text.strip()[:2000]
+                        )
+                    lf_score_span(span, "round_score_text", parsed["score"])
+                    await websocket.send_text(
+                        WSScore(value=parsed["score"]).model_dump_json()
+                    )
                 lf_end_span(
                     span,
                     output={"scored": turn_scored, "signal": turn_signal},
@@ -407,16 +770,15 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 )
                 # End ONLY on closed rounds: len(rounds) >= N with no open probe.
                 # Backfill saves rounds only, so the report always shows exactly N.
-                if (
-                    turn_scored
-                    and not _probe_open[session_id]
-                    and len(rounds) >= config.num_questions
+                # Second trigger — reported-instead-of-probing: bank exhausted
+                # and the turn streamed the mandatory "Verdict:" line (the agent
+                # chose the report over its FOLLOW_UP probe). Without this the
+                # interview strands: report on screen, socket open, no routing.
+                reported = saw_verdict
+                if await _maybe_finish_interview(
+                    websocket, session_id, rounds, config, ws_user,
+                    turn_scored=turn_scored, reported=reported,
                 ):
-                    await _ensure_final_save(session_id, rounds, config, ws_user)
-                    await _send_safe(websocket, '{"type":"report"}')
-                    _drop_session_state(session_id)
-                    lf_flush()
-                    lf_drop_session(session_id)
                     return
                 break
     except WebSocketDisconnect:
@@ -483,6 +845,7 @@ async def audio_ws(websocket: WebSocket, session_id: str):
     from .runner import _session_service, APP_NAME
 
     await get_or_create_session(session_id, config, ws_user)
+    config.voice_mode = True  # same flag the text-socket voice path sets
     _voice_sess = await _session_service.get_session(
         app_name=APP_NAME, user_id=ws_user, session_id=session_id
     )
@@ -675,13 +1038,330 @@ async def upload(file: UploadFile, namespace: str = "default"):
     )
 
 
-@app.get("/sessions/{session_id}/report", response_model=Report)
-async def read_report(session_id: str):
-    """Report persisted by the agent's save tools (needs Firebase creds in .env)."""
+async def _finalize_enrichment(session_id: str) -> None:
+    """Persist backend-owned report content while the session's in-memory eval
+    notes/answers still exist. Best-effort by design: the report page retries
+    its own GET, and static placeholders remain honest on a total failure.
+
+    Must run BEFORE _drop_session_state — see _maybe_finish_interview."""
+    try:
+        await _enriched_scores(session_id)
+    except Exception:  # noqa: BLE001 — enrichment must never break the signal
+        pass
+
+
+# --- agent report-text parsing (adk-web parity: the streamed text IS the report)
+# The interviewer writes the final report as text. Parsing it lets the UI show
+# exactly what the candidate saw — no second model call, and it survives the
+# agent skipping every tool (Lite does this under load).
+_RPT_SCORE = re.compile(r"score\s*:\s*(\d+(?:\.\d+)?)\s*/\s*10", re.I)
+_RPT_VERDICT = re.compile(r"verdict\s*:\s*(.+)", re.I)
+_RPT_HEADS = [
+    (
+        "strengths",
+        re.compile(r"^(?:\*\*|__)?\s*(?:key\s+)?strengths\s*(?:\*\*|__)?\s*:?\s*(.*)$", re.I),
+    ),
+    (
+        "gaps",
+        re.compile(
+            r"^(?:\*\*|__)?\s*(?:key\s+)?(?:gaps|growth\s+areas|weaknesses)\s*"
+            r"(?:\*\*|__)?\s*:?\s*(.*)$",
+            re.I,
+        ),
+    ),
+    (
+        "study_next",
+        re.compile(
+            r"^(?:\*\*|__)?\s*(?:what\s+to\s+study\s+next|study\s+next|"
+            r"recommended\s+study\s+topics|topics\s+to\s+study)\s*(?:\*\*|__)?\s*:?\s*(.*)$",
+            re.I,
+        ),
+    ),
+]
+_RPT_OTHER_HEAD = re.compile(
+    r"^(?:\*\*|__)?\s*(?:interview\s+report|per-?question\s+scores|scores|"
+    r"overall\s+score|summary|score|verdict)\b",
+    re.I,
+)
+
+
+def _clean_bullet(line: str) -> str:
+    line = re.sub(r"^[-*•]\s*", "", line.strip())
+    return re.sub(r"^\d+[.)]\s*", "", line).strip()
+
+
+def _text_score(text: str) -> float | None:
+    """First 'Score: N/10' in the agent's text — the turn's headline score.
+    Markdown emphasis is stripped first (agents bold the label)."""
+    m = _RPT_SCORE.search((text or "").replace("**", "").replace("__", ""))
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except ValueError:
+        return None
+    return value if 0.0 <= value <= 10.0 else None
+
+
+def _parse_report_text(text: str) -> dict:
+    """Parse the agent's streamed report into report fields.
+
+    Returns any of: score, strengths, gaps, study_next, verdict, verdict_why.
+    Tolerant of markdown bold, bullets, and numbered lists.
+    """
+    out: dict = {}
+    section: str | None = None
+    buf: dict[str, list[str]] = {"strengths": [], "gaps": [], "study_next": []}
+
+    for raw in (text or "").splitlines():
+        line = raw.strip().replace("**", "").replace("__", "")
+        if not line:
+            continue
+        if "score" not in out:
+            value = _text_score(line)
+            if value is not None:
+                out["score"] = value
+        mv = _RPT_VERDICT.search(line)
+        if mv:
+            val = mv.group(1).strip().strip("*_` ")
+            head = re.split(r"\s*[—–-]\s*|\s*:\s*", val, maxsplit=1)[0].strip()
+            if head in ("Strong Hire", "Hire", "No Hire"):
+                out["verdict"] = head
+                rest = val[len(head):].lstrip(" —–-:").strip().strip("*_` ")
+                if rest:
+                    out["verdict_why"] = rest[:300]
+            section = None
+            continue
+        matched = None
+        for key, rx in _RPT_HEADS:
+            m2 = rx.match(line)
+            if m2:
+                matched = (key, (m2.group(1) or "").strip())
+                break
+        if matched:
+            section, inline = matched
+            if inline:
+                buf[section].append(_clean_bullet(inline))
+            continue
+        if _RPT_OTHER_HEAD.match(line):
+            section = None
+            continue
+        if section in buf:
+            buf[section].append(_clean_bullet(line))
+
+    for key, parts in buf.items():
+        joined = "\n".join(p for p in parts if p)
+        if joined:
+            out[key] = joined[:1200]
+    return out
+
+
+async def _enriched_scores(session_id: str) -> dict:
+    """Scores doc, enriched when the agent left text fields empty.
+
+    Priority (each fills only blanks; anything already saved wins):
+    1. The agent's OWN parsed report text (_report_parsed) — no model call.
+    2. Per-turn evaluator notes captured backend-side.
+    3. One summarizer Lite call for whatever is still blank (rare).
+    Every failure path returns the raw doc (placeholders stay honest).
+    """
     from interviewiq_agent.tools.persistence import _db
 
-    doc = _db().collection("scores").document(session_id).get()
-    data = doc.to_dict() or {}
+    ref = _db().collection("scores").document(session_id)
+    snap = ref.get()
+    if not snap.exists:
+        # Never synthesize a doc from enrichment alone — a doc holding only
+        # strengths/gaps (no per_question/overall/user_id) is a phantom that
+        # pollutes nothing and misleads everything. No doc → report defaults.
+        return {}
+    data = snap.to_dict() or {}
+    notes = [n for n in _eval_notes.get(session_id, []) if n.get("strengths") or n.get("gaps")]
+    parsed = _report_parsed.get(session_id) or {}
+    answers = _answers.get(session_id, {})
+    if not notes and not parsed and not answers:
+        return data  # nothing backend-owned to enrich with
+    if session_id in _enriching:
+        return data  # another pass is in flight; the poller re-reads shortly
+
+    _enriching.add(session_id)
+    try:
+        patch: dict = {}
+        # 1) The agent's OWN report text wins — highest fidelity, and it costs
+        #    no model call (the content the candidate already saw on screen).
+        for key in ("strengths", "gaps", "study_next", "verdict", "verdict_why"):
+            if not data.get(key) and parsed.get(key):
+                patch[key] = parsed[key]
+        # 2) Per-turn evaluator notes fill any still-blank strengths/gaps.
+        if not data.get("strengths") and not patch.get("strengths") and notes:
+            patch["strengths"] = "\n".join(
+                f"• {n['strengths']}" for n in notes[:10] if n.get("strengths")
+            )[:2000]
+        if not data.get("gaps") and not patch.get("gaps") and notes:
+            patch["gaps"] = "\n".join(
+                f"• {n['gaps']}" for n in notes[:10] if n.get("gaps")
+            )[:2000]
+        # 3) Summarizer ONLY for what is still blank — rare once the text parsed.
+        merged = {**data, **patch}
+        needs_gen = (
+            not merged.get("study_next")
+            or not merged.get("verdict_why")
+            or not merged.get("strengths")
+            or not merged.get("gaps")
+        ) and answers
+        if needs_gen:
+            gen = await asyncio.to_thread(_summarize_session, session_id, data)
+            if gen:
+                if not merged.get("verdict") and gen.get("verdict") in (
+                    "Strong Hire", "Hire", "No Hire",
+                ):
+                    patch["verdict"] = gen["verdict"]
+                if not merged.get("verdict_why") and gen.get("verdict_why"):
+                    patch["verdict_why"] = gen["verdict_why"]
+                if not merged.get("study_next") and gen.get("study_next"):
+                    patch["study_next"] = gen["study_next"]
+                if not merged.get("strengths") and gen.get("strengths"):
+                    patch["strengths"] = gen["strengths"]
+                if not merged.get("gaps") and gen.get("gaps"):
+                    patch["gaps"] = gen["gaps"]
+        if patch:
+            try:
+                ref.set(patch, merge=True)
+                data = {**data, **patch}
+            except Exception:  # noqa: BLE001 — read still succeeds with raw doc
+                pass
+        return data
+    finally:
+        _enriching.discard(session_id)
+
+
+def _summarize_session(session_id: str, data: dict) -> dict:
+    """Enrichment content for one session. Retries the single Lite call up to
+    3× (~8s apart): 503 season kills most first attempts. Invoked at interview
+    finish (before _drop_session_state) and memoized into the doc, so retries
+    never duplicate. Final failure is LOGGED (silent {} cost an hour of
+    debugging once already); placeholders stay honest."""
+    import logging as _logging
+
+    for attempt in range(3):
+        try:
+            out = _try_summarize(session_id, data)
+            if out:
+                return out
+        except Exception as ex:  # noqa: BLE001 — retryable until attempts run out
+            if attempt < 2:
+                import time as _time
+
+                _time.sleep(2)
+                continue
+            _logging.getLogger(__name__).warning(
+                "summarizer gave up for %s after 3 tries (%s: %s)",
+                session_id, type(ex).__name__, str(ex)[:160],
+            )
+            return {}
+    _logging.getLogger(__name__).warning(
+        "summarizer returned unusable shape for %s", session_id
+    )
+    return {}
+
+
+def _parse_summary(text: str) -> dict:
+    """Tolerant shape parser for the summarizer reply. Lite rarely honors
+    'EXACTLY these lines' — it wraps in fences, bullets, bold keys. Accept
+    all of that; reject only genuinely missing content."""
+    import re
+
+    out: dict = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip().strip("`").strip()
+        line = re.sub(r"^[-*•\d.)\s]+", "", line).strip()
+        line = line.replace("**", "")
+        m = re.match(r"^(verdict|why|study|strengths|gaps)\s*[:\-–]\s*(.+)$", line, re.I)
+        if not m:
+            continue
+        key, val = m.group(1).lower(), m.group(2).strip()
+        if key == "verdict" and val in ("Strong Hire", "Hire", "No Hire"):
+            out["verdict"] = val
+        elif key == "why" and val:
+            out["verdict_why"] = val[:300]
+        elif key == "study" and val:
+            out["study_next"] = val[:800]
+        elif key == "strengths" and val:
+            out["strengths"] = val[:800]
+        elif key == "gaps" and val:
+            out["gaps"] = val[:800]
+    return out if out.get("verdict") and out.get("study_next") else {}
+
+
+_summary_client_singleton = None
+
+
+def _summary_client():
+    """One shared genai client for the summarizer.
+
+    A throwaway genai.Client(...) per call gets collected mid-request and dies
+    with "Cannot send a request, as the client has been closed" (genai's
+    continuation path re-touches the client after the first response) — which
+    silently killed every verdict/study enrichment. Reuse one client instead.
+    """
+    global _summary_client_singleton
+    if _summary_client_singleton is None:
+        import os
+
+        from google import genai
+
+        _summary_client_singleton = genai.Client(
+            api_key=os.getenv("GOOGLE_API_KEY", "")
+        )
+    return _summary_client_singleton
+
+
+def _try_summarize(session_id: str, data: dict) -> dict:
+    """One Lite call → verdict + why + study + strengths + gaps. Strict shape;
+    {} on any deviation (placeholders stay instead of invented content).
+    Exceptions propagate to the retrying caller — no silent swallowing here."""
+    from interviewiq_agent.config import _MODEL
+
+    rounds = []
+    answers = _answers.get(session_id, {})
+    for i, s in enumerate(data.get("per_question", []) or []):
+        a = answers.get(i, "")
+        rounds.append(f"Round {i + 1}: score {s}/10. Answer: {a[:600]}")
+    if not rounds:
+        return {}
+    prompt = (
+        "You are grading metadata, not chatting. Interview topic: "
+        f"{data.get('topic') or data.get('mode', '')}. Overall: {data.get('overall')}/10.\n"
+        + "\n".join(rounds)
+        + "\nRespond EXACTLY these five lines, nothing else:\n"
+        "VERDICT: <Strong Hire | Hire | No Hire>\n"
+        "WHY: <one line>\n"
+        "STUDY: <2-4 topics as 'topic — what to practice', separated by ' | '>\n"
+        "STRENGTHS: <2-3 lines on what the candidate demonstrably did well>\n"
+        "GAPS: <2-3 lines on concrete misses>"
+    )
+    try:
+        resp = _summary_client().models.generate_content(model=_MODEL, contents=prompt)
+    except RuntimeError as ex:
+        if "closed" in str(ex).lower():
+            # Poisoned transport: drop it so the caller's retry rebuilds one.
+            global _summary_client_singleton
+            _summary_client_singleton = None
+        raise
+    parsed = _parse_summary(resp.text or "")
+    if not parsed:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "summarizer shape miss for five-line contract; raw head: %r",
+            (resp.text or "")[:300],
+        )
+    return parsed
+
+
+@app.get("/sessions/{session_id}/report", response_model=Report)
+async def read_report(session_id: str):
+    """Report: agent-saved content when present, backend-enriched otherwise."""
+    data = await _enriched_scores(session_id)
     return Report(
         session_id=session_id,
         per_question=data.get("per_question", []),

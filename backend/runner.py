@@ -44,6 +44,7 @@ async def get_or_create_session(session_id: str, config: SessionConfig, user_id:
             "persona_tone": config.persona.tone,
             "difficulty": config.persona.difficulty,
             "num_questions": config.num_questions,
+            "voice_mode": bool(config.voice_mode),
             "transcript": [],
             "scores": [],
         },
@@ -81,6 +82,9 @@ async def stream_events(session_id: str, text: str, user_id: str = DEV_USER_ID):
             score = _extract_score(response)
             if score is not None:
                 yield ("score", (score, _extract_signal(response)))
+                eval_notes = _extract_eval(response)
+                if eval_notes is not None:
+                    yield ("eval", eval_notes)
 
 
 def _is_quota_error(ex: Exception) -> bool:
@@ -142,6 +146,23 @@ async def restore_qindex(session_id: str, user_id: str, value: int) -> None:
             pass
 
 
+async def question_bank(session_id: str, user_id: str = DEV_USER_ID) -> list[str]:
+    """The session's stored question list (empty when setup never stored one).
+
+    Authoritative question column for the transcript: store_questions writes the
+    FULL bank into session state once at setup, so it survives a missed
+    next_question frame or a socket reconnect. Read-only — never creates a
+    session (a missing one means there is nothing to persist).
+    """
+    sess = await _session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=session_id
+    )
+    if sess is None:
+        return []
+    bank = (sess.state or {}).get("question_bank") or []
+    return [str(q).strip() for q in bank if q and str(q).strip()]
+
+
 def _extract_signal(response) -> str | None:
     """Find the evaluator's signal vote, tolerating nesting (mirrors _extract_score)."""
     if isinstance(response, dict):
@@ -156,6 +177,36 @@ def _extract_signal(response) -> str | None:
             found = _extract_signal(v)
             if found is not None:
                 return found
+    return None
+
+
+def _extract_eval(response) -> dict | None:
+    """Find {"strengths": str, "gaps": str} in a function-response payload,
+    tolerating nesting (mirrors _extract_score). Partial verdicts count — a
+    turn with only strengths still enriches the report; the summarizer covers
+    whatever text is missing."""
+    if isinstance(response, dict):
+        s, g = response.get("strengths"), response.get("gaps")
+        s = s.strip() if isinstance(s, str) else ""
+        g = g.strip() if isinstance(g, str) else ""
+        if s or g:
+            return {"strengths": s, "gaps": g}
+        for v in response.values():
+            found = _extract_eval(v)
+            if found is not None:
+                return found
+    if isinstance(response, (list, tuple)):
+        for v in response:
+            found = _extract_eval(v)
+            if found is not None:
+                return found
+    if isinstance(response, str):
+        import json
+
+        try:
+            return _extract_eval(json.loads(response))
+        except (ValueError, TypeError):
+            return None
     return None
 
 
@@ -220,3 +271,40 @@ def build_start_prompt(config: SessionConfig) -> str:
     if config.mode in ("C", "D", "E") and config.file_namespace:
         base += f"Indexed content is under namespace '{config.file_namespace}'. "
     return base + "Ask the first question now."
+
+
+def build_retry_prompt(stage: str) -> str:
+    """Nudge for a clean-miss retry (503/429 before ANY output streamed).
+
+    ADK appends the caller's message to the session BEFORE the model call, so
+    the original text is already in the conversation. Re-sending it verbatim
+    duplicates the turn — the agent reads the candidate as "repeating" itself,
+    and for the start prompt it concludes the interview is over and emits a
+    bogus final report. Send a distinct nudge instead: the instruction to keep
+    going without repeating the message that is already in the history.
+    """
+    if stage == "start":
+        return "Continue: ask the first interview question now."
+    return "Continue: evaluate the candidate's last answer, then proceed."
+
+
+async def interview_started(session_id: str, user_id: str = DEV_USER_ID) -> bool:
+    """True once the interviewer has produced ANY event — i.e. the interview has
+    actually begun.
+
+    The start turn must be driven exactly ONCE per session. A socket reconnect
+    re-entered the start turn and appended a SECOND setup message to the same
+    ADK session (ADK persists the user message even when the model call fails),
+    so the agent saw the candidate "repeating the setup prompt" and bailed with
+    a bogus 0/10 No-Hire report. This probe is how the WS handler decides to
+    resync the screen instead of re-driving the model.
+    """
+    try:
+        sess = await _session_service.get_session(
+            app_name=APP_NAME, user_id=user_id, session_id=session_id
+        )
+    except Exception:  # noqa: BLE001 — a probe must never block the interview
+        return False
+    if sess is None:
+        return False
+    return any(ev.author != "user" and ev.content for ev in sess.events)

@@ -95,6 +95,10 @@ export default function SetupPage() {
         file_namespace: mode === "C" || mode === "D" ? fileNamespace : "",
         persona,
         num_questions: mode === "B" && customQuestions.length > 0 ? customQuestions.length : numQuestions,
+        // Voice mode still runs over the text socket (browser STT/TTS), so tell
+        // the backend: it switches off probing and counts every answer as a
+        // round — without this a 5-question voice run reported only 3.
+        voice_mode: isVoiceMode,
       };
 
       const result = await createSession(payload);
@@ -129,8 +133,8 @@ export default function SetupPage() {
         <div className="border-b border-zinc-200 dark:border-white/10 pb-5">
           <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2">
             <div>
-              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">
-                New Interview
+              <h1 className="font-display font-medium text-2xl sm:text-3xl text-zinc-900 dark:text-zinc-100">
+                Configure Interview Session
               </h1>
               <p className="text-xs sm:text-sm text-zinc-600 dark:text-zinc-400 mt-1">
                 Pick a mode, tune the interviewer, start when ready.

@@ -26,6 +26,10 @@ class SessionConfig(BaseModel):
     file_namespace: str = ""  # modes C/D: Pinecone namespace of the upload
     persona: Persona = Field(default_factory=Persona)
     num_questions: int = 5
+    # Turn-based voice (browser STT/TTS) runs over the text socket, so the mode
+    # must be explicit — it drives the interviewer's "never probe" rule and the
+    # backend's round bookkeeping. Set by the setup screen's voice toggle.
+    voice_mode: bool = False
 
 
 class CreateSessionResponse(BaseModel):

@@ -3,6 +3,7 @@
 import React, { useState } from "react";
 import { ClockCounterClockwise, CaretDown, CaretUp, CheckCircle } from "@phosphor-icons/react";
 import { type TurnHistory } from "@/lib/useInterviewSocket";
+import { questionText } from "@/lib/questionText";
 import { TOKENS } from "@/lib/tokens";
 
 interface HistoryRailProps {
@@ -68,8 +69,12 @@ export function HistoryRail({ history }: HistoryRailProps) {
                     </span>
                   )}
                 </div>
+                {/* The round's QUESTION only: the raw turn text also carried the
+                mandated "Score: …" line and any agent-invented greeting. The
+                score already shows as the badge above (and in the score
+                reveal). lib/questionText.ts — display filter, nothing stored. */}
                 <p className="text-xs font-medium text-zinc-800 dark:text-zinc-200 line-clamp-2">
-                  {turn.question}
+                  {questionText(turn.question)}
                 </p>
                 <div className="pt-1 border-t border-zinc-200/60 dark:border-white/5">
                   <p className="text-[11px] text-zinc-600 dark:text-zinc-400 italic line-clamp-2">

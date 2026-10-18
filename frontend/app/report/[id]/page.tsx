@@ -31,10 +31,18 @@ export default function ReportPage({
 
       try {
         // The End click navigates here instantly while the backend is still
-        // streaming + saving — poll until rounds land (or ~30s), so a fresh
-        // 0-round read never freezes into a permanent 0.0 report.
+        // streaming + saving + enriching (strengths/gaps/study/verdict are
+        // generated server-side after the report signal). Poll until rounds
+        // land AND the enrichment text arrives (or ~30s), so a fresh read never
+        // freezes into placeholders with empty text fields.
+        const needsText = (d: Report) =>
+          !d.strengths && !d.gaps && !d.study_next;
         let data = await getReport(sessionId);
-        for (let i = 0; i < 15 && data.per_question.length === 0; i++) {
+        for (
+          let i = 0;
+          i < 15 && (data.per_question.length === 0 || needsText(data));
+          i++
+        ) {
           await new Promise((r) => setTimeout(r, 2000));
           if (!isMounted) return;
           data = await getReport(sessionId);

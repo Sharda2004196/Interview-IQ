@@ -115,7 +115,14 @@ export function useInterviewSocket({ sessionId, onSessionEnd, enabled = true }: 
         try {
           const data = JSON.parse(event.data);
 
-          if (data.type === "token") {
+          if (data.type === "question") {
+            // Reconnect resync: REPLACE the on-screen question with the last
+            // turn's text. A fresh page load has no local buffer, and appending
+            // would show the question twice.
+            tokenBufferRef.current = "";
+            setCurrentQuestion(data.text || "");
+            setIsStreamingQuestion(false);
+          } else if (data.type === "token") {
             setIsStreamingQuestion(true);
             tokenBufferRef.current += data.text || "";
             scheduleFlush();
@@ -193,9 +200,16 @@ export function useInterviewSocket({ sessionId, onSessionEnd, enabled = true }: 
   useEffect(() => {
     if (!enabled) return;
     isExplicitlyClosedRef.current = false;
-    connect();
+    // Defer the connect by a tick. React StrictMode (dev) mounts -> unmounts ->
+    // mounts, so a SYNCHRONOUS connect() here leaves a throwaway socket whose
+    // handler the backend accepts and drives a full start turn for — i.e. two
+    // Q1 generation rounds and two set-up messages per page load. That doubled
+    // request burst is the main reason 503s appear locally on the frontend but
+    // not in `adk web`. Deferring lets the first cleanup cancel it: one socket.
+    const connectTimer = setTimeout(() => connect(), 0);
 
     return () => {
+      clearTimeout(connectTimer);
       // Clear timers
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);

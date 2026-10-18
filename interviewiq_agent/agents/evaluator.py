@@ -6,7 +6,7 @@ from google.adk.agents.llm_agent import Agent
 from google.adk.tools.agent_tool import AgentTool
 from pydantic import BaseModel, Field
 
-from ..config import _MODEL
+from ..config import build_model
 
 
 class EvalResult(BaseModel):
@@ -19,7 +19,7 @@ class EvalResult(BaseModel):
 
 
 evaluator = Agent(
-    model=_MODEL,
+    model=build_model(),
     name="evaluator",
     description="Scores answers and decides follow-up vs next question vs difficulty shift.",
     instruction="""You evaluate the candidate's latest answer. Respond in exactly this shape:

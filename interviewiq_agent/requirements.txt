@@ -1,4 +1,5 @@
 google-adk==2.8.0
+google-genai==2.22.0
 pinecone==10.0.0
 firebase-admin==7.5.0
 pypdf==6.18.0

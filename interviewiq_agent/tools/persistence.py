@@ -78,11 +78,23 @@ def save_transcript(
     mode: str,
     difficulty: str,
     turns: list[dict],
+    user_id: str = "",
     tool_context: ToolContext | None = None,
 ) -> dict:
-    """Persist Q&A turns. turns=[{"q":..,"a":..,"score":..}]. Returns {"turns": n}."""
+    """Persist Q&A turns. turns=[{"q":..,"a":..,"score":..}]. Returns {"turns": n}.
+
+    user_id pins ownership exactly like save_score: the agent's tool call
+    resolves it from session state, while the backend backfill passes the
+    socket's uid explicitly (no ToolContext, must NOT fall back to the shared
+    dev identity, or a logged-in owner's transcript is invisible to them).
+    """
     _db().collection("sessions").document(session_id).set(
-        {"user_id": _uid(tool_context), "mode": mode, "difficulty": difficulty, "turns": turns},
+        {
+            "user_id": user_id or _uid(tool_context),
+            "mode": mode,
+            "difficulty": difficulty,
+            "turns": turns,
+        },
         merge=True,
     )
     return {"turns": len(turns)}

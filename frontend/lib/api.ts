@@ -20,6 +20,9 @@ export interface SessionConfig {
   file_namespace: string;
   persona: Persona;
   num_questions: number;
+  /** Turn-based voice runs over the text socket; the backend needs the flag to
+   *  honour "voice mode never probes" and to count every answer as a round. */
+  voice_mode?: boolean;
 }
 
 export interface Report {

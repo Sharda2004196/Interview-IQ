@@ -55,8 +55,10 @@ export function QuestionCard({
         </div>
       </div>
 
-      {/* Main question content or Skeleton state */}
-      {!question && isStreaming ? (
+      {/* Main question content or Skeleton state. No question yet (or none at
+      all — the score's justification mid-stream, or the final report) shows the
+      waiting skeleton: the card never renders non-question text. */}
+      {!question ? (
         <div className="space-y-3 py-2 animate-pulse">
           <div className="h-4 bg-zinc-200 dark:bg-zinc-800 rounded w-3/4" />
           <div className="h-4 bg-zinc-200 dark:bg-zinc-800 rounded w-full" />

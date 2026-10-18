@@ -5,6 +5,13 @@
    changes its icon while the theme never moves (the reported bug). */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Orbitron exposed as a Tailwind font family token, so `font-display`
+   resolves to the next/font variable set on <body>. `inline` keeps the
+   var reference instead of inlining the resolved value. */
+@theme inline {
+  --font-display: var(--font-orbitron);
+}
+
 @layer base {
   :root {
     --background: #fafafa;

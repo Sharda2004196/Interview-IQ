@@ -67,7 +67,9 @@ def _clients():
         raise RuntimeError("PINECONE_API_KEY missing in interviewiq_agent/.env")
     if not google_key:
         raise RuntimeError("GOOGLE_API_KEY missing in interviewiq_agent/.env")
-    return Pinecone(api_key=pinecone_key), genai.Client(api_key=google_key)
+    return Pinecone(api_key=pinecone_key), genai.Client(
+        api_key=google_key, http_options=config.http_options()
+    )
 
 
 def _index(pc):

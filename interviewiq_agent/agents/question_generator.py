@@ -9,7 +9,7 @@ from google.adk.agents.llm_agent import Agent
 from google.adk.tools.agent_tool import AgentTool
 from pydantic import BaseModel, Field
 
-from ..config import _MODEL
+from ..config import build_model
 from ..tools.fetch_url import fetch_url_tool
 from ..tools.parse_file import parse_file_tool
 from ..tools.retrieve_context import retrieve_context_tool, upsert_document_tool
@@ -22,7 +22,7 @@ class QuestionBank(BaseModel):
 
 
 question_generator = Agent(
-    model=_MODEL,
+    model=build_model(),
     name="question_generator",
     description="Generates interview questions for the active session mode.",
     instruction="""You generate interview questions. The session mode tells you how:

@@ -17,9 +17,17 @@ MODEL = "gemini-3.5-flash-lite"
 
 def main() -> None:
     from google import genai
+    from google.genai import types
 
     text = sys.stdin.read()
-    client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+    # Bounded retry: the default client retries 503s internally for minutes,
+    # which stalls the parent's parallel translation with no visible progress.
+    client = genai.Client(
+        api_key=os.environ["GOOGLE_API_KEY"],
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(initial_delay=1, attempts=2)
+        ),
+    )
     resp = client.models.generate_content(
         model=MODEL,
         contents=(
