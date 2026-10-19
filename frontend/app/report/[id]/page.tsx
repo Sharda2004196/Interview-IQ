@@ -3,7 +3,7 @@
 import React, { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { WarningCircle, ArrowClockwise, ArrowLeft } from "@phosphor-icons/react";
-import { getReport, type Report } from "@/lib/api";
+import { ApiError, getReport, type Report } from "@/lib/api";
 import { useFirebaseUser } from "@/lib/firebase";
 import { LoginGate } from "@/components/LoginGate";
 import { ReportView } from "@/components/ReportView";
@@ -21,13 +21,22 @@ export default function ReportPage({
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const gateUser = useFirebaseUser();
+  // uid, not the User object: the object identity churns on token refresh and
+  // would restart the poll loop mid-flight.
+  const uid = gateUser?.uid ?? null;
 
   useEffect(() => {
     let isMounted = true;
 
     async function loadReport() {
+      // Logged out: LoginGate renders instead, and a tokenless read is a 401 in
+      // strict mode. Wait for a real user, and refetch if the user changes.
+      if (!uid) return;
       setIsLoading(true);
       setError(null);
+      // Drop any previous report: on an account switch, a failed fetch must not
+      // leave the previous user's report on screen.
+      setReport(null);
 
       try {
         // The End click navigates here instantly while the backend is still
@@ -52,22 +61,20 @@ export default function ReportPage({
           setIsLoading(false);
         }
       } catch (err: unknown) {
-        if (isMounted) {
-          // If Firestore is not configured or offline, fallback to graceful demo summary
-          console.warn("Backend report fetch failed, providing fallback structure:", err);
-          setReport({
-            session_id: sessionId,
-            per_question: [8.0, 7.5, 9.0],
-            overall: 8.2,
-            strengths: "Clear mental models for distributed state, effective communication of trade-offs.",
-            gaps: "Could address corner-case failure recovery and throughput limits in more depth.",
-            study_next: "1. Raft consensus state machine replication\n2. Optimistic concurrency control\n3. Consistent hashing algorithms",
-            verdict: "",
-            verdict_why: "",
-            adjustment: "",
-          });
-          setIsLoading(false);
-        }
+        if (!isMounted) return;
+        // A denied report must never look like a successful interview. The old
+        // branch here fabricated an 8.2 report, which would have masked the
+        // backend's 404 and broken "every report is generated per session".
+        const status = err instanceof ApiError ? err.status : 0;
+        setError(
+          status === 404
+            ? "This report isn't available for your account. It may have been deleted, or it belongs to a different sign-in."
+            : status === 401
+              ? "Your sign-in has expired. Reload the page, then sign in again to view this report."
+              : "We couldn't reach the interview service. Check your connection and try again.",
+        );
+        setIsLoading(false);
+        console.error("Report load failed:", err);
       }
     }
 
@@ -76,7 +83,7 @@ export default function ReportPage({
     return () => {
       isMounted = false;
     };
-  }, [sessionId]);
+  }, [sessionId, uid]);
 
   if (gateUser === undefined) {
     return (

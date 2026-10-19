@@ -18,6 +18,10 @@ services:
         value: false
       - key: LANGFUSE_ENV
         value: production
+      # Keep in sync with the dashboard value. Without it the code falls back to
+      # AUTH_MODE=open (no token -> dev user) — see backend/auth.py.
+      - key: AUTH_MODE
+        value: strict
       # Filled in dashboard AFTER first deploy (backend URL known):
       # FRONTEND_URL=https://<frontend-service>.onrender.com
       - key: GOOGLE_API_KEY

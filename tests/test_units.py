@@ -262,6 +262,63 @@ def test_pdf_report_renders_transcript_turns():
     assert len(filled) > len(empty)
 
 
+def test_pdf_report_renders_qualitative_sections():
+    """Regression: the download carried only the scoreboard, silently dropping
+    strengths/gaps/study_next/verdict_why — the qualitative half the web report
+    renders (ReportView.tsx:241/264/296/155)."""
+    from backend.report_pdf import build_report_pdf, report_sections
+
+    report = {
+        "session_id": "s",
+        "overall": 8.0,
+        "per_question": [8.0],
+        "strengths": "Clear trade-off reasoning.",
+        "gaps": "Missed failure modes.",
+        "study_next": "Practice idempotency keys.",
+        "verdict": "Hire",
+        "verdict_why": "Solid core, thin on edge cases.",
+    }
+    assert [h for h, _ in report_sections(report)] == [
+        "Why this verdict",
+        "Strengths",
+        "Gaps to close",
+        "Study next",
+    ]
+    # Blank fields are dropped, never printed as empty headings.
+    assert report_sections({"session_id": "s", "overall": 8.0}) == []
+    blank = build_report_pdf({"session_id": "s", "overall": 8.0}, [])
+    filled = build_report_pdf(report, [])
+    assert blank.startswith(b"%PDF") and filled.startswith(b"%PDF")
+    assert len(filled) > len(blank)
+
+
+def test_pdf_verdict_falls_back_to_thresholds():
+    """Same rule as the web report (ReportView.tsx:26-36): a stored verdict
+    wins only when it is real, else `overall` decides — so the PDF never
+    prints a blank verdict."""
+    from backend.report_pdf import _verdict
+
+    assert _verdict({"overall": 8.0}) == "Strong Hire"
+    assert _verdict({"overall": 5.0}) == "Hire"
+    assert _verdict({"overall": 4.9}) == "No Hire"
+    assert _verdict({"overall": 2.0, "verdict": "Hire"}) == "Hire"
+    assert _verdict({"overall": 2.0, "verdict": "garbage"}) == "No Hire"
+
+
+def test_report_ownership_gate():
+    """Report reads are scoped to the caller: a real uid only sees its own docs,
+    while legacy (no owner) and shared local-dev docs stay readable so old
+    sessions and local probe scripts keep working."""
+    from backend.main import _owned_by
+    from interviewiq_agent.tools.persistence import DEV_USER_ID
+
+    assert _owned_by({"user_id": "u1"}, "u1") is True
+    assert _owned_by({"user_id": "u1"}, "u2") is False
+    assert _owned_by({}, "u2") is True
+    assert _owned_by({"user_id": ""}, "u2") is True
+    assert _owned_by({"user_id": DEV_USER_ID}, "u2") is True
+
+
 def test_build_turns_pairs_question_answer_and_score():
     from backend import main as M
 
@@ -584,3 +641,201 @@ def test_is_quota_error():
 
     assert _is_quota_error(Fake500("x")) is False
     assert _is_quota_error(ValueError("x")) is False
+
+
+def test_session_create_rejects_foreign_namespace(monkeypatch):
+    """Mode C/D must not retrieve a knowledge base uploaded by another account."""
+    from fastapi.testclient import TestClient
+
+    from backend import main as M
+    from interviewiq_agent.tools import persistence as P
+
+    monkeypatch.setattr(P, "upload_owner", lambda ns: {"user_id": "someone-else"})
+
+    def boom(*a, **k):
+        raise AssertionError("session created despite a foreign namespace")
+
+    monkeypatch.setattr(M, "get_or_create_session", boom)
+
+    client = TestClient(M.app)
+    # No token in open mode -> DEV_USER_ID, i.e. not "someone-else".
+    r = client.post(
+        "/sessions",
+        json={"mode": "C", "topic": "x", "file_namespace": "upload-abc"},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_upload_refuses_foreign_namespace(monkeypatch, tmp_path):
+    """A logged-in user must not write chunks into someone else's namespace."""
+    from fastapi.testclient import TestClient
+
+    from backend import main as M
+    from interviewiq_agent.tools import persistence as P
+
+    monkeypatch.setattr(P, "upload_owner", lambda ns: {"user_id": "someone-else"})
+    monkeypatch.setattr(M, "UPLOAD_DIR", tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(M, "parse_file", lambda p: calls.append("parse") or {})
+    monkeypatch.setattr(M, "upsert_document", lambda *a, **k: calls.append("upsert") or {})
+
+    client = TestClient(M.app)
+    r = client.post("/upload?namespace=upload-abc", files={"file": ("r.txt", b"hello")})
+    assert r.status_code == 403, r.text
+    assert calls == []  # refused before parsing or writing a single chunk
+
+
+def test_interview_slots_cap_distinct_sessions(monkeypatch):
+    """Slots bound simultaneous interviews and refcount a reconnect, so a dropped
+    socket neither frees a stranger's slot nor locks a user out of their own."""
+    from backend import main as M
+
+    monkeypatch.setattr(M, "_active_interviews", {})
+    monkeypatch.setattr(M, "MAX_CONCURRENT_INTERVIEWS", 2)
+
+    assert M._acquire_slot("a") is True
+    assert M._acquire_slot("a") is True   # reconnect reuses its own slot
+    assert M._acquire_slot("b") is True
+    assert M._acquire_slot("c") is False  # two DISTINCT live sessions = full
+    M._release_slot("a")
+    M._release_slot("a")                  # first socket's finally, then the second
+    assert M._acquire_slot("c") is True
+    M._release_slot("a")                  # stale/duplicate release must not go negative
+    M._release_slot("b")
+    M._release_slot("c")
+    assert M._active_interviews == {}
+    assert M._acquire_slot("d") is True
+    assert M._acquire_slot("e") is True
+    assert M._acquire_slot("f") is False
+
+
+def test_upload_rejects_oversized_file(monkeypatch, tmp_path):
+    """Cap is enforced before parsing/embedding and before anything hits disk."""
+    from fastapi.testclient import TestClient
+
+    from backend import main as M
+    from interviewiq_agent.tools import persistence as P
+
+    monkeypatch.setattr(P, "upload_owner", lambda ns: {})
+    monkeypatch.setattr(M, "UPLOAD_DIR", tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(M, "parse_file", lambda p: calls.append("parse") or {})
+    monkeypatch.setattr(M, "upsert_document", lambda *a, **k: calls.append("upsert") or {})
+
+    client = TestClient(M.app)
+    big = b"x" * (M.MAX_UPLOAD_BYTES + 1)
+    r = client.post("/upload?namespace=ns1", files={"file": ("big.pdf", big)})
+    assert r.status_code == 413, r.text
+    assert calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_upload_pins_namespace_to_caller(monkeypatch, tmp_path):
+    """A successful upload records the caller as the namespace owner."""
+    from fastapi.testclient import TestClient
+
+    from backend import main as M
+    from interviewiq_agent.tools import persistence as P
+
+    monkeypatch.setattr(P, "upload_owner", lambda ns: {})
+    pinned: list[tuple] = []
+    monkeypatch.setattr(P, "save_upload_owner", lambda *a: pinned.append(a))
+    monkeypatch.setattr(M, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(
+        M, "parse_file", lambda p: {"text": "hi", "chars": 2, "file": "r.txt"}
+    )
+    monkeypatch.setattr(M, "upsert_document", lambda *a, **k: {"chunks": 1})
+
+    client = TestClient(M.app)
+    r = client.post("/upload?namespace=ns-fresh", files={"file": ("r.txt", b"hi")})
+    assert r.status_code == 200, r.text
+    # No token in open mode -> DEV_USER_ID is the caller.
+    assert pinned == [("ns-fresh", P.DEV_USER_ID, "r.txt")]
+
+
+def test_interview_socket_refuses_when_slots_are_full(monkeypatch):
+    """The guard is wired into the socket itself, not just the helper: a 4th
+    distinct live session gets an error frame and never reaches the agent, and
+    the refusal must not disturb the slots already held."""
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    from backend import main as M
+
+    occupied = {"a": 1, "b": 1, "c": 1}
+    monkeypatch.setattr(M, "_active_interviews", occupied)
+    monkeypatch.setattr(M, "MAX_CONCURRENT_INTERVIEWS", 3)
+    monkeypatch.setitem(
+        M._pending_configs, "sess-busy", (SessionConfig(mode="A", topic="x"), "local-dev")
+    )
+
+    client = TestClient(M.app)
+    with client.websocket_connect("/ws/sess-busy") as ws:
+        frame = ws.receive_text()
+        assert '"type":"error"' in frame
+        assert "busy" in frame
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_text()
+    assert occupied == {"a": 1, "b": 1, "c": 1}  # busy socket never took a slot
+
+
+class _FakeSnap:
+    def __init__(self, data: dict | None):
+        self.exists = data is not None
+        self._data = data or {}
+
+    def to_dict(self) -> dict:
+        return self._data
+
+
+class _FakeDoc:
+    def __init__(self, data: dict | None):
+        self._data = data
+
+    def get(self) -> _FakeSnap:
+        return _FakeSnap(self._data)
+
+
+class _FakeBatch:
+    def delete(self, *refs) -> None:
+        pass
+
+    def commit(self) -> None:
+        pass
+
+
+class _FakeDB:
+    """Just enough Firestore for the delete route: one doc read + batch delete."""
+
+    def __init__(self, data: dict | None):
+        self._data = data
+
+    def collection(self, _name: str) -> "_FakeDB":
+        return self
+
+    def document(self, _id: str) -> _FakeDoc:
+        return _FakeDoc(self._data)
+
+    def batch(self) -> _FakeBatch:
+        return _FakeBatch()
+
+
+def test_delete_session_refuses_foreign_owner(monkeypatch):
+    """Deletion is destructive, so another account's session id must answer 404.
+    A session the caller owns — or one that no longer exists — stays 200, so the
+    route keeps its idempotent contract."""
+    from fastapi.testclient import TestClient
+
+    from backend import main as M
+    from interviewiq_agent.tools import persistence as P
+
+    client = TestClient(M.app)
+
+    monkeypatch.setattr(P, "_db", lambda: _FakeDB({"user_id": "someone-else"}))
+    assert client.delete("/sessions/sess-x").status_code == 404
+
+    monkeypatch.setattr(P, "_db", lambda: _FakeDB({"user_id": P.DEV_USER_ID}))
+    assert client.delete("/sessions/sess-x").status_code == 200
+
+    monkeypatch.setattr(P, "_db", lambda: _FakeDB(None))
+    assert client.delete("/sessions/sess-x").status_code == 200

@@ -68,9 +68,24 @@ app.add_middleware(
 UPLOAD_DIR = Path(__file__).with_name("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# Embedding + vector writes are the expensive part of an upload and they are
+# paid from free-tier quota, so cap the bytes BEFORE parsing/embedding. This
+# rejects after the body reaches the server (Starlette already spooled it) but
+# before any model or Pinecone call.
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+
 
 @app.post("/sessions", response_model=CreateSessionResponse)
 async def create_session(config: SessionConfig, user_id: str = Depends(get_current_user)):
+    # A client-chosen namespace is usable only by the account that uploaded it:
+    # otherwise Mode C/D would retrieve someone else's resume as context.
+    # 404 keeps "not yours" and "does not exist" indistinguishable.
+    if config.file_namespace:
+        from interviewiq_agent.tools.persistence import upload_owner
+
+        existing = upload_owner(config.file_namespace)
+        if existing and not _owned_by(existing, user_id):
+            raise HTTPException(status_code=404, detail="Knowledge base not found.")
     session_id = f"sess-{uuid.uuid4().hex[:8]}"
     await get_or_create_session(session_id, config, user_id)
     # Seed the interview by sending the start prompt through the agent on first WS answer.
@@ -386,9 +401,47 @@ def _pin_answer(answers: dict, index: int, answer_text: str) -> None:
         answers[index] = answer_text.strip()[:2000]
 
 
+# Free-tier guard: one Render instance + several Gemini calls per turn means
+# parallel interviews contend for CPU and the per-minute quota. Slots bound
+# SIMULTANEOUS interviews, not users. Keyed by session and refcounted so a
+# reconnect reuses its own slot — a flaky network must never push someone out
+# of their own interview. Single-process state is fine because the app runs on
+# one instance (min-instances=0); scaling to two instances would need Redis.
+MAX_CONCURRENT_INTERVIEWS = int(os.getenv("MAX_CONCURRENT_INTERVIEWS", "3"))
+_active_interviews: dict[str, int] = {}  # session_id -> live socket count
+
+
+def _acquire_slot(session_id: str) -> bool:
+    """Reserve a live-interview slot. True = proceed.
+
+    Already-active session -> always allowed (refcount++). Otherwise a new
+    DISTINCT session only fits while fewer than MAX_CONCURRENT_INTERVIEWS are
+    active. No await between check and mutation, so it is atomic on the loop.
+    """
+    if session_id in _active_interviews:
+        _active_interviews[session_id] += 1
+        return True
+    if len(_active_interviews) >= MAX_CONCURRENT_INTERVIEWS:
+        return False
+    _active_interviews[session_id] = 1
+    return True
+
+
+def _release_slot(session_id: str) -> None:
+    """Drop one live socket for `session_id`; idempotent, never negative."""
+    remaining = _active_interviews.get(session_id, 0) - 1
+    if remaining > 0:
+        _active_interviews[session_id] = remaining
+    else:
+        _active_interviews.pop(session_id, None)
+
+
 @app.websocket("/ws/{session_id}")
 async def interview_ws(websocket: WebSocket, session_id: str):
     await websocket.accept()
+    # Flips to True only when this socket actually reserved a slot, so the
+    # finally below cannot decrement someone else's interview on an early return.
+    holds_slot = False
     # .get, NOT .pop: the frontend reconnects on drops, and a consumed config
     # turned every reconnect into "Unknown session" (the death loop you saw).
     pending = _pending_configs.get(session_id)
@@ -400,6 +453,21 @@ async def interview_ws(websocket: WebSocket, session_id: str):
             )
             return
         config, ws_user = pending
+        # Slots are reserved AFTER the pending check: a stray connect to an
+        # unknown session id must not consume capacity.
+        if not _acquire_slot(session_id):
+            await _send_safe(
+                websocket,
+                WSError(
+                    message="All interview slots are busy — try again in a minute."
+                ).model_dump_json(),
+            )
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
+            return
+        holds_slot = True
         # WS auth state: any client message may carry {"token": ...} (verified
         # against the POST uid, consumed, never treated as an answer). Strict
         # mode refuses answers until a valid token has been seen.
@@ -783,6 +851,9 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                 break
     except WebSocketDisconnect:
         pass
+    finally:
+        if holds_slot:
+            _release_slot(session_id)
 
 
 @app.websocket("/ws/audio/{session_id}")
@@ -983,10 +1054,18 @@ async def list_sessions(user_id: str = Depends(get_current_user)):
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, user_id: str = Depends(get_current_user)):
-    """Delete one past session (score + transcript docs). Idempotent: always 200."""
+    """Delete one past session (score + transcript docs). Idempotent: always 200.
+
+    Ownership: a doc that exists and belongs to someone else answers 404 (same
+    rule as the report routes). Deletion is destructive, so it must never be
+    cross-account; a MISSING doc still returns 200 so retries stay idempotent.
+    """
     from interviewiq_agent.tools.persistence import _db
 
     db = _db()
+    existing = db.collection("scores").document(session_id).get()
+    if existing.exists and not _owned_by(existing.to_dict() or {}, user_id):
+        raise HTTPException(status_code=404, detail="Session not found.")
     batch = db.batch()
     batch.delete(db.collection("scores").document(session_id))
     batch.delete(db.collection("sessions").document(session_id))
@@ -1028,11 +1107,41 @@ async def healthz_head():
 
 
 @app.post("/upload", response_model=UploadResponse)
-async def upload(file: UploadFile, namespace: str = "default"):
-    dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}-{file.filename}"
-    dest.write_bytes(await file.read())
+async def upload(
+    file: UploadFile,
+    namespace: str = "default",
+    user_id: str = Depends(get_current_user),
+):
+    """Auth-gated ingestion.
+
+    Pins the client-chosen namespace to this caller and validates it first: a
+    logged-in user may only append chunks to a namespace they own. Unrecorded
+    namespaces stay writable (legacy/shared local-dev), and no token in strict
+    mode means no writes into the vector index at all.
+    """
+    from interviewiq_agent.tools.persistence import save_upload_owner, upload_owner
+
+    # Refuse a foreign namespace before touching disk or the vector index, so a
+    # denied request cannot append chunks to someone else's resume.
+    existing = upload_owner(namespace)
+    if existing and not _owned_by(existing, user_id):
+        raise HTTPException(status_code=403, detail="Namespace unavailable.")
+    # Read at most cap+1: reading the whole body first would let one huge
+    # upload exhaust the 512 MB instance BEFORE the 413 is ever raised.
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(data) // (1024 * 1024)} MB). Max 5 MB.",
+        )
+    # Path(...).name strips any "../" in the client-supplied filename: the uuid
+    # prefix does not stop traversal on its own.
+    safe_name = Path(file.filename or "upload.bin").name
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}-{safe_name}"
+    dest.write_bytes(data)
     parsed = parse_file(str(dest))
     n = upsert_document(parsed["text"], namespace, doc_name=parsed["file"])
+    save_upload_owner(namespace, user_id, parsed["file"])
     return UploadResponse(
         file=parsed["file"], chars=parsed["chars"], chunks=n["chunks"], namespace=namespace
     )
@@ -1156,7 +1265,7 @@ def _parse_report_text(text: str) -> dict:
     return out
 
 
-async def _enriched_scores(session_id: str) -> dict:
+async def _enriched_scores(session_id: str, user_id: str | None = None) -> dict:
     """Scores doc, enriched when the agent left text fields empty.
 
     Priority (each fills only blanks; anything already saved wins):
@@ -1164,6 +1273,9 @@ async def _enriched_scores(session_id: str) -> dict:
     2. Per-turn evaluator notes captured backend-side.
     3. One summarizer Lite call for whatever is still blank (rare).
     Every failure path returns the raw doc (placeholders stay honest).
+
+    ``user_id`` is the HTTP caller for ownership checks (None = internal
+    backend caller, ungated).
     """
     from interviewiq_agent.tools.persistence import _db
 
@@ -1175,6 +1287,11 @@ async def _enriched_scores(session_id: str) -> dict:
         # pollutes nothing and misleads everything. No doc → report defaults.
         return {}
     data = snap.to_dict() or {}
+    # Ownership gate BEFORE any enrichment write: a foreign caller must never
+    # cause a patch to someone else's doc. user_id=None is the internal
+    # final-save path, which has no HTTP caller.
+    if user_id is not None and not _owned_by(data, user_id):
+        raise HTTPException(status_code=404, detail="Report not found.")
     notes = [n for n in _eval_notes.get(session_id, []) if n.get("strengths") or n.get("gaps")]
     parsed = _report_parsed.get(session_id) or {}
     answers = _answers.get(session_id, {})
@@ -1358,10 +1475,36 @@ def _try_summarize(session_id: str, data: dict) -> dict:
     return parsed
 
 
+def _owned_by(data: dict, user_id: str) -> bool:
+    """May `user_id` use this owned doc (score/report/namespace record)?
+
+    Missing owner = legacy doc (written before user_id was pinned) -> readable,
+    and DEV_USER_ID = the shared local-dev bucket -> readable (local dev and
+    probe scripts). Anything else must match the caller exactly.
+
+    The same rule covers `uploads/{namespace}` records: an empty owner means
+    the namespace predates ownership and stays usable.
+
+    Legacy docs stay readable on purpose: they predate ownership and are already
+    invisible to Past Reports (that listing filters by user_id), so denying them
+    would only break direct links to old sessions.
+    """
+    from interviewiq_agent.tools.persistence import DEV_USER_ID
+
+    owner = str(data.get("user_id") or "")
+    if not owner or owner == DEV_USER_ID:
+        return True
+    return owner == user_id
+
+
 @app.get("/sessions/{session_id}/report", response_model=Report)
-async def read_report(session_id: str):
-    """Report: agent-saved content when present, backend-enriched otherwise."""
-    data = await _enriched_scores(session_id)
+async def read_report(session_id: str, user_id: str = Depends(get_current_user)):
+    """Report: agent-saved content when present, backend-enriched otherwise.
+
+    Ownership: missing or foreign owner answers 404 (not 403) so the route
+    never confirms that another user's session id exists.
+    """
+    data = await _enriched_scores(session_id, user_id)
     return Report(
         session_id=session_id,
         per_question=data.get("per_question", []),
@@ -1376,26 +1519,24 @@ async def read_report(session_id: str):
 
 
 @app.get("/sessions/{session_id}/report.pdf")
-async def read_report_pdf(session_id: str):
-    """PDF download built from the same Firestore docs as the JSON report."""
+async def read_report_pdf(session_id: str, user_id: str = Depends(get_current_user)):
+    """PDF download built from the SAME enriched report the web page shows.
+
+    Reading the raw `scores` doc here used to drop every LLM-written field
+    (strengths/gaps/study_next/verdict_why), because only _enriched_scores()
+    fills those. Delegating to read_report() keeps the two artefacts identical
+    by construction — and means a later auth/ownership check on that endpoint
+    covers the download too.
+    """
     from fastapi.responses import Response
 
     from interviewiq_agent.tools.persistence import _db
 
     from .report_pdf import build_report_pdf
 
-    db = _db()
-    score = db.collection("scores").document(session_id).get().to_dict() or {}
-    sess = db.collection("sessions").document(session_id).get().to_dict() or {}
-    pdf = build_report_pdf(
-        {
-            "session_id": session_id,
-            "overall": score.get("overall", 0.0),
-            "per_question": score.get("per_question", []),
-            "adjustment": score.get("nudge_reason", ""),
-        },
-        sess.get("turns", []),
-    )
+    report = await read_report(session_id, user_id)
+    sess = _db().collection("sessions").document(session_id).get().to_dict() or {}
+    pdf = build_report_pdf(report.model_dump(), sess.get("turns", []))
     return Response(
         content=pdf,
         media_type="application/pdf",

@@ -174,5 +174,40 @@ def fill_report_meta(session_id: str, mode: str, topic: str) -> None:
         ref.set(patch, merge=True)
 
 
+def upload_owner(namespace: str) -> dict:
+    """Ownership record for a vector namespace ({} when unrecorded/legacy).
+
+    A namespace is a CLIENT-CHOSEN label, so without this record any logged-in
+    user could point a Mode C/D session at someone else's uploaded resume and
+    have the interviewer retrieve it as context. {} means "no record", which
+    callers treat as legacy and allow.
+    """
+    if not namespace:
+        return {}
+    snap = _db().collection("uploads").document(namespace).get()
+    return snap.to_dict() or {}
+
+
+def save_upload_owner(namespace: str, user_id: str, file: str = "") -> None:
+    """Pin a namespace to its uploader. First owner wins; created_at written once.
+
+    /upload refuses a foreign namespace before writing any chunk, so the
+    no-steal guard here only covers two simultaneous first uploads.
+    """
+    from firebase_admin import firestore as _fs
+
+    if not namespace:
+        return
+    ref = _db().collection("uploads").document(namespace)
+    snap = ref.get()
+    existing = (snap.to_dict() or {}) if snap.exists else {}
+    patch: dict = {"file": file, "updated_at": _fs.SERVER_TIMESTAMP}
+    if not existing.get("user_id"):
+        patch["user_id"] = user_id
+    if not existing.get("created_at"):
+        patch["created_at"] = _fs.SERVER_TIMESTAMP
+    ref.set(patch, merge=True)
+
+
 save_transcript_tool = FunctionTool(save_transcript)
 save_score_tool = FunctionTool(save_score)

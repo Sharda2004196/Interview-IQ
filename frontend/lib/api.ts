@@ -72,6 +72,18 @@ async function authHeaders(): Promise<Record<string, string>> {
   }
 }
 
+/** Error carrying the HTTP status, so callers can tell "not yours" (404) and
+ * "not signed in" (401) apart from a real outage. */
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 export async function getReport(sessionId: string): Promise<Report> {
   const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/report`, {
     method: "GET",
@@ -83,7 +95,10 @@ export async function getReport(sessionId: string): Promise<Report> {
 
   if (!res.ok) {
     const errorBody = await res.text();
-    throw new Error(`Failed to load report (${res.status}): ${errorBody || res.statusText}`);
+    throw new ApiError(
+      `Failed to load report (${res.status}): ${errorBody || res.statusText}`,
+      res.status,
+    );
   }
 
   return res.json();
