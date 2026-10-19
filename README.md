@@ -40,15 +40,18 @@ Browser (Next.js 15)
   └─ WebSocket ─────────► /ws/{session_id}
                             │
                             ▼
-                     ADK Runner ──► interviewer_agent  (root, no subagents)
-                                      ├─ question_generator   AgentTool
-                                      ├─ evaluator            AgentTool
-                                      ├─ question_bank        FunctionTool
-                                      ├─ retrieve_context     FunctionTool ──► Pinecone
-                                      └─ save_score / save_transcript ──────► Firestore
+                     ADK Runner ──► interviewer_agent  (root, 0 sub-agents)
+                                      ├─ question_generator  AgentTool
+                                      │    └─ parse_file · fetch_url · upsert_document
+                                      │       · retrieve_context ─────────────────► Pinecone
+                                      ├─ evaluator           AgentTool
+                                      ├─ store_questions / next_question   FunctionTools
+                                      └─ save_score / save_transcript      FunctionTools ──► Firestore
                                             ▲
                               Gemini 3.5 Flash-Lite (AI Studio free tier)
 ```
+
+Three agents total: `interviewer_agent` is the root; `question_generator` and `evaluator` are complete ADK agents mounted as `AgentTool`s, so they return structured data inside the same turn instead of transferring control. The root itself exposes no sub-agents (`sub_agents=[]`), which is what keeps the flow from stalling between turns.
 
 A turn: the candidate answers → the evaluator returns `{score, strengths, gaps, signal}` → the interviewer asks the next banked question at the adjusted difficulty.
 
@@ -88,7 +91,7 @@ Every REST endpoint except the health check requires a Firebase ID token. "Owner
 | --- | --- |
 | Frontend | Next.js 15 (App Router), React 19, Tailwind CSS 4, TypeScript |
 | API | FastAPI + Uvicorn, REST + WebSocket |
-| Agents | Google ADK 2.8 (`google-adk`), one root agent + AgentTools |
+| Agents | Google ADK 2.8 (`google-adk`) — one root agent, two agents mounted as tools, plus FunctionTools |
 | Models | `gemini-3.5-flash-lite` via AI Studio, fallback chain `gemini-2.5-flash-lite` → `gemini-3.1-flash-lite` |
 | Retrieval | Pinecone (hybrid: Gemini embeddings + hashed sparse vectors), 1,500-char chunks / 150 overlap |
 | Data | Firestore (Spark) — scores, transcripts, namespace ownership |
@@ -159,12 +162,11 @@ Free-tier quota is a design constraint, not an afterthought: the upload cap and 
 
 ## Deploy
 
-`render.yaml` defines two free-tier services: `interviewiq-backend` (Docker, health check `/healthz`) and `interviewiq-frontend` (Node, `npm run build`), with secrets entered once in the dashboard.
+`render.yaml` defines two free-tier services: `interviewiq-backend` (Docker, health check `/healthz`) and `interviewiq-frontend` (Node, `npm run build`), with secrets entered once in the dashboard. It also declares `AUTH_MODE=strict`, so a backend created from the blueprint starts locked down instead of falling back to open mode.
 
-Two things that live outside the blueprint on purpose:
+One thing that lives outside the blueprint on purpose:
 
-1. **`AUTH_MODE=strict`** is set in the Render dashboard, not in `render.yaml` — flipping it is a deliberate switch, because it rejects every tokenless client at once.
-2. **`NEXT_PUBLIC_API_URL` is baked in at build time.** Set it to the backend URL *before* building the frontend service, and rebuild after changing it.
+**`NEXT_PUBLIC_API_URL` is baked in at build time.** Set it to the backend URL *before* building the frontend service, and rebuild after changing it.
 
 Deploy order: point Render at the repo as a Blueprint → fill the `sync: false` secrets → set `FRONTEND_URL` on the backend (CORS) → set `NEXT_PUBLIC_API_URL` on the frontend and rebuild → add the frontend host to Firebase's authorized domains.
 
@@ -193,3 +195,22 @@ assets/             screenshots
 - Free-tier services sleep; expect a cold start on the first request.
 - Speech input relies on the browser Web Speech API, which is Chromium-centric.
 - Uploaded files are parsed, then embedded; the raw file lands on the container's ephemeral disk.
+
+## Contributing
+
+Issues and pull requests are welcome. Keep changes small and testable:
+
+1. Fork the repo and branch off `main`.
+2. Before opening a PR, run the deterministic suite and the type check:
+   ```bash
+   python -m pytest -q
+   cd frontend && npx tsc --noEmit
+   ```
+3. `python evals/eval.py` spends real Gemini quota — run it when you touch prompts, scoring, or the model chain, not on every change.
+4. No new services or dependencies that require billing; the project is built to stay inside free tiers.
+
+Bug reports are most useful with the mode (A–E), what you typed or uploaded, and the backend log line if there is one.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
