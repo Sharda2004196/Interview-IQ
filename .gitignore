@@ -15,6 +15,7 @@ docs/
 AGENTS.md
 CLAUDE.md
 Py_sdk_migration.md
+Latest Resume.txt
 
 # Runtime artifacts — never belong in git (node_modules alone is 500MB+).
 node_modules/

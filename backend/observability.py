@@ -135,18 +135,34 @@ def trace_id_for(session_id: str) -> str | None:
     return _traces.get(session_id)
 
 
-def _base_attrs(session_id: str, extra_meta: dict, env: str) -> dict:
+def _base_attrs(
+    session_id: str, extra_meta: dict, env: str, user_id: str | None = None
+) -> dict:
     attrs = {
         "langfuse.session.id": session_id,
         "langfuse.environment": env,
     }
+    # Reserved attribute Langfuse's Users view and cost-per-user rollups read.
+    # Metadata (langfuse.trace.metadata.user) is NOT the same thing: it is just
+    # a filterable key, so without this the trace stays anonymous in Users.
+    if user_id:
+        attrs["langfuse.user.id"] = user_id
     for k, v in (extra_meta or {}).items():
         attrs[f"langfuse.trace.metadata.{k}"] = v
     return attrs
 
 
-def start_span(session_id: str, name: str, input=None, metadata=None):
-    """Open a turn span (sent on end_span). Returns handle or None."""
+def start_span(
+    session_id: str,
+    name: str,
+    input=None,
+    metadata=None,
+    user_id: str | None = None,
+):
+    """Open a turn span (sent on end_span). Returns handle or None.
+
+    `user_id` is the authenticated uid (Firebase), stamped as langfuse.user.id.
+    """
     try:
         import json as _json
 
@@ -155,7 +171,7 @@ def start_span(session_id: str, name: str, input=None, metadata=None):
         if k is None or tid is None:
             return None
         _host, _auth, env = k
-        attrs = _base_attrs(session_id, metadata, env)
+        attrs = _base_attrs(session_id, metadata, env, user_id)
         attrs["langfuse.trace.name"] = f"interview-{session_id}"
         attrs["langfuse.observation.type"] = "span"
         if input is not None:

@@ -515,6 +515,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     input={"mode": config.mode, "topic": config.topic,
                             "num_questions": config.num_questions},
                     metadata=turn_meta,
+                    user_id=ws_user,
                 )
                 # Start-turn burst protection (same clean-miss rule as answer
                 # turns): a 503/429 before ANY token streamed replays after a
@@ -677,6 +678,7 @@ async def interview_ws(websocket: WebSocket, session_id: str):
                     f"round-{round_no}-attempt-{attempt}",
                     input={"answer": answer_text},
                     metadata={**turn_meta, "round": round_no, "attempt": attempt},
+                    user_id=ws_user,
                 )
                 try:
                     events = stream_events(

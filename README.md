@@ -98,7 +98,7 @@ Every REST endpoint except the health check requires a Firebase ID token. "Owner
 | Auth | Firebase Auth (Google sign-in), ID tokens verified server-side |
 | Voice | Browser Web Speech API (`SpeechRecognition`) + `speechSynthesis`, turn-based |
 | Reports | fpdf2 server-side PDF; React + react-markdown in the UI |
-| Tracing | Langfuse over native OTLP/HTTP (no SDK), inert when keys are absent |
+| Tracing | Langfuse over native OTLP/HTTP (no SDK) — per-session and per-user traces, inert when keys are absent |
 
 ## Run it locally
 
@@ -137,7 +137,7 @@ Beyond that, the app is local-first: no billing account, no Vertex AI, no paid t
 ## Tests
 
 ```bash
-python -m pytest -q                 # 60 deterministic tests — no network, no LLM, no quota (venv active)
+python -m pytest -q                 # 61 deterministic tests — no network, no LLM, no quota (venv active)
 python evals/eval.py                # live LLM eval (~8 calls); writes evals/results.json
 cd frontend && npx tsc --noEmit     # type check
 cd frontend && npm run build        # production build

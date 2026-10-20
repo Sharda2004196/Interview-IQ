@@ -839,3 +839,35 @@ def test_delete_session_refuses_foreign_owner(monkeypatch):
 
     monkeypatch.setattr(P, "_db", lambda: _FakeDB(None))
     assert client.delete("/sessions/sess-x").status_code == 200
+
+
+def test_langfuse_span_stamps_user_id(monkeypatch):
+    """Langfuse's Users view reads the reserved `langfuse.user.id` attribute, not
+    trace metadata — so the OTLP payload must carry it verbatim, and an
+    anonymous span must not grow an empty user id."""
+    from backend import observability as O
+
+    sent: list[tuple[str, dict]] = []
+    monkeypatch.setattr(O, "_keys", lambda: ("http://lf.local", "auth", "test"))
+    monkeypatch.setattr(
+        O, "_send_async", lambda path, payload: sent.append((path, payload))
+    )
+
+    def attrs_of(payload: dict) -> dict:
+        spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        return {a["key"]: a["value"] for a in spans[0]["attributes"]}
+
+    span = O.start_span(
+        "sess-lf-1", "round-1", input={"answer": "x"}, user_id="uid-42"
+    )
+    O.end_span(span, output={"status": "ok"})
+
+    path, payload = sent[-1]
+    attrs = attrs_of(payload)
+    assert path == "/api/public/otel/v1/traces"
+    assert attrs["langfuse.user.id"] == {"stringValue": "uid-42"}
+    assert attrs["langfuse.session.id"] == {"stringValue": "sess-lf-1"}
+
+    anonymous = O.start_span("sess-lf-2", "round-1")
+    O.end_span(anonymous, output={"status": "ok"})
+    assert "langfuse.user.id" not in attrs_of(sent[-1][1])
