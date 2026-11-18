@@ -51,14 +51,16 @@ from .schemas import (
 )
 
 app = FastAPI(title="InterviewIQ backend")
-# Browser frontend (localhost:3000 dev, Render URL in prod) talks cross-origin.
+# Browser frontend (localhost:3000 dev, Vercel in prod) talks cross-origin.
 # Without this, preflights (OPTIONS) 405 and the UI can never read responses —
 # even endpoints that succeed server-side, like your 200 /upload.
-# FRONTEND_URL env adds the prod origin (Render); localhost always allowed.
+# FRONTEND_URL takes one or more origins, comma separated, so the Vercel
+# frontend and an old Render URL can both be allowed during a migration.
 _cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
-_frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
-if _frontend_url and _frontend_url not in _cors_origins:
-    _cors_origins.append(_frontend_url)
+for _origin in os.getenv("FRONTEND_URL", "").split(","):
+    _origin = _origin.strip().rstrip("/")
+    if _origin and _origin not in _cors_origins:
+        _cors_origins.append(_origin)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,

@@ -22,8 +22,10 @@ services:
       # AUTH_MODE=open (no token -> dev user) — see backend/auth.py.
       - key: AUTH_MODE
         value: strict
-      # Filled in dashboard AFTER first deploy (backend URL known):
-      # FRONTEND_URL=https://<frontend-service>.onrender.com
+      # Filled in the dashboard AFTER the frontend URL is known.
+      # Comma separated if more than one origin must be allowed, e.g.
+      # FRONTEND_URL=https://interviewiq.vercel.app,https://old.onrender.com
+      # The frontend itself is hosted on Vercel now, not as a Render service.
       - key: GOOGLE_API_KEY
         sync: false
       - key: PINECONE_API_KEY
@@ -41,16 +43,3 @@ services:
       - key: LANGFUSE_BASE_URL
         sync: false
 
-  - type: web
-    name: interviewiq-frontend
-    runtime: node
-    plan: free
-    rootDir: frontend
-    buildCommand: npm install && npm run build
-    # `next start` honors Render's PORT env automatically.
-    startCommand: npm start
-    envVars:
-      # IMPORTANT: NEXT_PUBLIC_* bakes in at BUILD time. Set the backend URL
-      # first, then hit Manual Deploy -> Rebuild on this service.
-      - key: NEXT_PUBLIC_API_URL
-        sync: false
