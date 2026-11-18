@@ -27,3 +27,5 @@ frontend/.next/
 evals/results.json
 evals/run.err
 evals/run.log
+
+.vercel
