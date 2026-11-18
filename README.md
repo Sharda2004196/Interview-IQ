@@ -4,7 +4,7 @@ An agentic AI interviewer that runs a real technical interview end to end: it pi
 
 ![InterviewIQ setup screen](assets/InterviewIQ_SS.png)
 
-**Live:** <https://interviewiq-frontend-pxp5.onrender.com> · Google sign-in required · free tier, so the first request can take ~50 s to wake the services.
+**Live:** <https://interview-iq-omega-beryl.vercel.app> · Google sign-in required · the frontend is on Vercel; the API runs on the Render free tier, so the first request after a quiet spell can take ~50 s to wake.
 
 ---
 
@@ -31,6 +31,12 @@ An agentic AI interviewer that runs a real technical interview end to end: it pi
 | E | Web / YouTube URL | Article text or video transcript | fetched on demand |
 
 ## How it works
+
+![InterviewIQ architecture: the browser and Firebase Auth feed FastAPI; the ADK Runner drives interviewer_agent, which calls question_generator and evaluator as tools, backed by Gemini, Pinecone and Firestore; Langfuse receives OTLP traces.](assets/architecture.png)
+
+*REST configures the session; one WebSocket runs the turn loop; Firestore and Pinecone persist state; Langfuse traces every turn.*
+
+The same flow in text:
 
 ```
 Browser (Next.js 15)
@@ -162,13 +168,17 @@ Free-tier quota is a design constraint, not an afterthought: the upload cap and 
 
 ## Deploy
 
-`render.yaml` defines two free-tier services: `interviewiq-backend` (Docker, health check `/healthz`) and `interviewiq-frontend` (Node, `npm run build`), with secrets entered once in the dashboard. It also declares `AUTH_MODE=strict`, so a backend created from the blueprint starts locked down instead of falling back to open mode.
+`render.yaml` defines one free-tier service: `interviewiq-backend` (Docker, health check `/healthz`), with secrets entered once in the dashboard. It also declares `AUTH_MODE=strict`, so a backend created from the blueprint starts locked down instead of falling back to open mode.
 
-One thing that lives outside the blueprint on purpose:
+The frontend is **not** on Render. It deploys to Vercel from this repo with **Root Directory = `frontend`**, which keeps it off the 750 free instance hours that Render pools across every free service in a workspace. One awake Render service fits that budget; two do not, and the whole workspace gets suspended when the pool runs out.
 
-**`NEXT_PUBLIC_API_URL` is baked in at build time.** Set it to the backend URL *before* building the frontend service, and rebuild after changing it.
+Two values tie the halves together:
 
-Deploy order: point Render at the repo as a Blueprint → fill the `sync: false` secrets → set `FRONTEND_URL` on the backend (CORS) → set `NEXT_PUBLIC_API_URL` on the frontend and rebuild → add the frontend host to Firebase's authorized domains.
+**`NEXT_PUBLIC_API_URL` is baked in at build time.** It is set in Vercel, points at the Render backend URL, and requires a redeploy after any change.
+
+**`FRONTEND_URL` on the backend controls CORS.** It accepts a comma-separated list, so a new frontend origin can be added before the old one is retired.
+
+Deploy order: Render Blueprint → fill the `sync: false` secrets → import the repo on Vercel with Root Directory `frontend` → set `NEXT_PUBLIC_API_URL` there → set `FRONTEND_URL` on the backend → add the Vercel host to Firebase's authorized domains.
 
 ## Project layout
 
